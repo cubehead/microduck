@@ -9,6 +9,7 @@ use duck_auth::{ProvisionedKey, RobotConfirm, Session};
 use duck_ble::framing::{self, Reassembler};
 use tokio::sync::mpsc;
 
+use crate::diagnostics;
 use crate::link::{Link, QUEUE};
 use crate::session;
 use crate::upstream::{Pool, Sockets};
@@ -26,10 +27,20 @@ enum State {
 }
 
 /// Serve one central; every inbound and outbound application line is Noise-protected.
-pub async fn run(mut link: Link, sockets: Sockets, config: Config) {
+pub async fn run(link: Link, sockets: Sockets, config: Config) {
+    run_with_diagnostics(link, sockets, config, diagnostics::Shared::default()).await;
+}
+
+pub async fn run_with_diagnostics(
+    mut link: Link,
+    sockets: Sockets,
+    config: Config,
+    mut shared: diagnostics::Shared,
+) {
     let (replies_tx, mut replies) = mpsc::channel::<String>(QUEUE);
     let config_socket = sockets.config.clone();
     let mut pool = Pool::new(sockets, replies_tx);
+    let mut diagnostic_subscriber = None::<diagnostics::Subscriber>;
     let mut inbound = Reassembler::new();
     let mut state = State::Start;
     let mut authenticated = true;
@@ -63,6 +74,21 @@ pub async fn run(mut link: Link, sockets: Sockets, config: Config) {
                             let Ok(line) = std::str::from_utf8(&plain) else { return };
                             if line.len() > framing::MAX_LINE { return }
                             deadline.as_mut().reset(tokio::time::Instant::now() + SESSION_IDLE);
+                            if let Some((reply, subscribe)) = diagnostics::request(line) {
+                                if !reply.is_empty() {
+                                    let Ok(ciphertext) = secure.seal(reply.as_bytes()) else { return };
+                                    if send_frame(&link, Frame::Data(ciphertext)).await.is_err() { return }
+                                }
+                                if subscribe && diagnostic_subscriber.is_none() {
+                                    let mut subscriber = diagnostics::Subscriber::default();
+                                    if let Some(notification) = subscriber.notify(shared.mark_current()) {
+                                        let Ok(ciphertext) = secure.seal(notification.as_bytes()) else { return };
+                                        if send_frame(&link, Frame::Data(ciphertext)).await.is_err() { return }
+                                    }
+                                    diagnostic_subscriber = Some(subscriber);
+                                }
+                                continue;
+                            }
                             let outcome = session::dispatch(
                                 &mut pool, &config_socket, line, &mut authenticated, &mut unused_attempts,
                             ).await;
@@ -76,9 +102,22 @@ pub async fn run(mut link: Link, sockets: Sockets, config: Config) {
                     }
                 }
             }
+            changed = shared.changed(), if diagnostic_subscriber.is_some() => {
+                let State::Ready(secure) = &mut state else { return };
+                if changed.is_err() {
+                    diagnostic_subscriber = None;
+                    continue;
+                }
+                let snapshot = shared.mark_current();
+                if let Some(notification) = diagnostic_subscriber.as_mut().and_then(|sub| sub.notify(snapshot)) {
+                    let Ok(ciphertext) = secure.seal(notification.as_bytes()) else { return };
+                    if send_frame(&link, Frame::Data(ciphertext)).await.is_err() { return }
+                }
+            }
             line = replies.recv(), if matches!(state, State::Ready(_)) => {
                 let Some(line) = line else { break };
                 let State::Ready(secure) = &mut state else { return };
+                let Some(line) = crate::secure_log_budget::bound(&line) else { return };
                 let Ok(ciphertext) = secure.seal(line.as_bytes()) else { return };
                 if send_frame(&link, Frame::Data(ciphertext)).await.is_err() { return }
             }
@@ -132,6 +171,76 @@ mod tests {
                 return Frame::decode(&line, MAX_ROBOT_LINE).unwrap();
             }
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn diagnostics_needs_secure_opt_in_and_initial_snapshot_follows_ack() {
+        let key = [0x71; 32];
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("key");
+        std::fs::write(&path, "71".repeat(32)).unwrap();
+        let config = Config::load(&path, "test-duck".into()).unwrap();
+        let sockets = Sockets {
+            config: temp.path().join("config"),
+            robot: temp.path().join("robot"),
+            updater: temp.path().join("updater"),
+            nfc: temp.path().join("nfc"),
+        };
+        let (cache_tx, cache) = diagnostics::Shared::channel();
+        let (link, to_robot, mut from_robot) = Link::pair(20, "test phone");
+        let task = tokio::spawn(run_with_diagnostics(link, sockets, config, cache));
+        let (phone, first) = ClientStart::begin(&key, "test-duck").unwrap();
+        send(&to_robot, Frame::Start(first)).await;
+        let mut assembly = Reassembler::for_replies();
+        let Frame::Challenge(challenge) = receive(&mut from_robot, &mut assembly).await else {
+            panic!("challenge")
+        };
+        let (phone, proof) = phone.receive(&challenge).unwrap();
+        send(&to_robot, Frame::Confirm(proof)).await;
+        let Frame::Ready(ready) = receive(&mut from_robot, &mut assembly).await else {
+            panic!("ready")
+        };
+        let mut phone = phone.receive(&ready).unwrap();
+        let capabilities = br#"{"jsonrpc":"2.0","id":1,"method":"robot.diagnosticsCapabilities"}"#;
+        send(&to_robot, Frame::Data(phone.seal(capabilities).unwrap())).await;
+        let Frame::Data(reply) = receive(&mut from_robot, &mut assembly).await else {
+            panic!("reply")
+        };
+        let value: serde_json::Value =
+            serde_json::from_slice(&phone.open(&reply).unwrap()).unwrap();
+        assert_eq!(value["result"]["change_only"], true);
+        cache_tx.send_replace(Default::default());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), from_robot.recv())
+                .await
+                .is_err()
+        );
+        let subscribe = br#"{"jsonrpc":"2.0","id":2,"method":"robot.diagnosticsSubscribe"}"#;
+        send(&to_robot, Frame::Data(phone.seal(subscribe).unwrap())).await;
+        let Frame::Data(reply) = receive(&mut from_robot, &mut assembly).await else {
+            panic!("reply")
+        };
+        let value: serde_json::Value =
+            serde_json::from_slice(&phone.open(&reply).unwrap()).unwrap();
+        assert_eq!(value["id"], 2);
+        assert_eq!(value["result"]["subscribed"], true);
+        let Frame::Data(reply) = receive(&mut from_robot, &mut assembly).await else {
+            panic!("initial")
+        };
+        let value: serde_json::Value =
+            serde_json::from_slice(&phone.open(&reply).unwrap()).unwrap();
+        assert_eq!(value["method"], "robot.diagnostics");
+        assert_eq!(value["params"]["sequence"], 1);
+        assert!(value["params"]["battery_age_ms"].is_null());
+        cache_tx.send_replace(Default::default());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), from_robot.recv())
+                .await
+                .is_err()
+        );
+        drop(to_robot);
+        task.await.unwrap();
+        assert!(from_robot.recv().await.is_none());
     }
 
     #[tokio::test(start_paused = true)]

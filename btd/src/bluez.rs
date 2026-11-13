@@ -218,21 +218,45 @@ pub async fn serve(
     require_pairing: bool,
     secure: Option<crate::secure::Config>,
 ) -> bluer::Result<()> {
-    loop {
-        match serve_on_an_adapter(&sockets, &name, require_pairing, secure.clone()).await {
-            Ok(()) => tracing::warn!(
-                retry_in = ?ADAPTER_RETRY,
-                "BLE registration ended; registering again after the retry delay"
-            ),
-            // Not fatal, deliberately: every failure reachable here is a property of the radio or
-            // of BlueZ, and none of them is fixed by dying. See this function's own doc comment.
-            Err(e) => tracing::warn!(
-                error = %e,
-                retry_in = ?ADAPTER_RETRY,
-                "BLE bring-up failed"
-            ),
+    let (samples, diagnostics) = crate::diagnostics::Shared::channel();
+    // Scope collection to this serve future, including adapter retries.
+    let source = async {
+        if secure.is_some() {
+            crate::diagnostics::collect(sockets.clone(), samples).await;
+        } else {
+            std::future::pending::<()>().await;
         }
-        tokio::time::sleep(ADAPTER_RETRY).await;
+    };
+    tokio::pin!(source);
+    let serve = async {
+        loop {
+            match serve_on_an_adapter(
+                &sockets,
+                &name,
+                require_pairing,
+                secure.clone(),
+                diagnostics.clone(),
+            )
+            .await
+            {
+                Ok(()) => tracing::warn!(
+                    retry_in = ?ADAPTER_RETRY,
+                    "BLE registration ended; registering again after the retry delay"
+                ),
+                // Not fatal, deliberately: every failure reachable here is a property of the radio or
+                // of BlueZ, and none of them is fixed by dying. See this function's own doc comment.
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    retry_in = ?ADAPTER_RETRY,
+                    "BLE bring-up failed"
+                ),
+            }
+            tokio::time::sleep(ADAPTER_RETRY).await;
+        }
+    };
+    tokio::select! {
+        () = &mut source => unreachable!("diagnostics collector does not exit"),
+        result = serve => result,
     }
 }
 
@@ -245,6 +269,7 @@ async fn serve_on_an_adapter(
     name: &NameChoice,
     require_pairing: bool,
     secure: Option<crate::secure::Config>,
+    diagnostics: crate::diagnostics::Shared,
 ) -> bluer::Result<()> {
     let sockets = sockets.clone();
     let name = name.clone();
@@ -512,6 +537,7 @@ async fn serve_on_an_adapter(
                         let slot = for_notify.clone();
                         let sockets = sockets.clone();
                         let secure = secure.clone();
+                        let diagnostics = diagnostics.clone();
                         let reset_registration = for_reset.clone();
                         let mtu = mtu.clone();
                         async move {
@@ -539,7 +565,13 @@ async fn serve_on_an_adapter(
                                 }
                                 let session = tokio::spawn(async move {
                                     if let Some(config) = secure {
-                                        crate::secure::run(link, sockets, config).await;
+                                        crate::secure::run_with_diagnostics(
+                                            link,
+                                            sockets,
+                                            config,
+                                            diagnostics,
+                                        )
+                                        .await;
                                     } else {
                                         session::run(link, sockets).await;
                                     }

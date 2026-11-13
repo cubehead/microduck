@@ -35,9 +35,11 @@ pub mod agent;
 #[cfg(target_os = "linux")]
 pub mod bluez;
 pub mod chorale;
+pub mod diagnostics;
 pub mod link;
 pub mod pairing;
 pub mod route;
 pub mod secure;
+mod secure_log_budget;
 pub mod session;
 pub mod upstream;
