@@ -16,6 +16,11 @@ serde.workspace = true
 serde_json.workspace = true
 semver.workspace = true
 
+# `clock`: CLOCK_MONOTONIC / CLOCK_REALTIME, which std does not expose as raw nanoseconds. Unix
+# only, like the daemons that stamp with it: `duckctl` builds on Windows too.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # `tempfile` only for the identity round-trip test: it needs a writable runtime root, and a
 # test cannot have /run.
 [dev-dependencies]

@@ -16,8 +16,11 @@ pub mod imui2c;
 pub mod io;
 pub mod model;
 pub mod obs;
+pub mod pickup;
 pub mod policy;
 pub mod safety;
+/// A robot in MuJoCo, over TCP — the backend `robotd-design.md` §9 deferred.
+pub mod sim;
 
 pub use hardware::{
     HD1910_BAM_M1, HD1910_FIRMWARE, HD1910_RUNTIME_KD, HD1910_RUNTIME_KP, Hd1910BamM1,
@@ -25,10 +28,10 @@ pub use hardware::{
 };
 pub use imu::ImuData;
 pub use io::{
-    FakeImu, FakeIo, ImuIo, ImuStale, IoError, JointTargets, RobotIo, Sensors, SlowSensors,
+    Census, FakeImu, FakeIo, ImuIo, ImuStale, IoError, JointTargets, RobotIo, Sensors, SlowSensors,
 };
 pub use model::{
     BATTERY_EMPTY_V, BATTERY_FULL_V, DEFAULT_POSITION, IMU_DXL_ID, JOINT_IDS, JOINT_NAMES,
-    NUM_JOINTS, battery_percent, standing_pose,
+    NUM_JOINTS, REST_POSITION, battery_percent, standing_pose,
 };
 pub use obs::{ACTION_LEN, Command, OBS_LEN, Observation};

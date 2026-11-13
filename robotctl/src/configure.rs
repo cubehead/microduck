@@ -16,470 +16,241 @@
 //!
 //! ## How edits are applied
 //!
-//! The file is parsed with `toml_edit`, which preserves everything it does not touch —
-//! comments, ordering, keys from releases this build does not know. Edits set or remove
-//! exactly the keys changed. Before anything is written, the candidate is re-parsed through
-//! `Params::load` — the daemon's own gate, range checks included — so this tool cannot write a
-//! file `robotd` would refuse to start on.
+//! Not here. [`robotd_params::edit`] is the writer — `toml_edit` over the daemon's own schema,
+//! validated through `Params::load` before anything reaches the disk, written atomically — and it
+//! lives beside that schema because it is no longer the only caller. `robotctl policy` and
+//! `robotctl pad` write keys of their own, and a daemon serving `pad.bind` over the radio has to
+//! write the same file. A second implementation would drift, and what it would drift on is the
+//! validation.
 //!
-//! That preservation and that gate used to contradict each other, and the contradiction was
-//! reachable: a board carrying a section from a branch kept it here by design, and then `load`
-//! rejected the whole file, so no edit could be saved at all until someone deleted a section that
-//! did nothing. `load` now names unknown keys and ignores them, which makes both halves true at
-//! once. Typos are still caught, one layer up: this only ever writes keys the registry knows.
+//! What is left in this module is the part that is genuinely an operator tool's: which systemd
+//! unit a change needs restarted, restarting it, printing a divergence list, and the full-screen
+//! editor.
 //!
-//! Writes are atomic (temp file + rename beside the target), because half a config at the
-//! moment of a power cut is a robot that will not start.
+//! ## Making a change take
 //!
-//! ## Restart
+//! Mostly the daemons read the file **once at startup** (`robotd-params` docs), so mostly a
+//! change needs a restart — and *which* daemon is derived from the keys that changed rather than
+//! assumed: `[media]` is `mediad` reading the same file, and a "restart robotd" offer over a
+//! video setting is an edit that reads as having done nothing at all.
 //!
-//! The daemons read the file **once at startup** (`robotd-params` docs) — so every change
-//! requires a restart, and the exit flow offers one whenever anything was written. *Which*
-//! daemon is derived from the keys that changed, not assumed: `[media]` is `mediad` reading the
-//! same file, and a "restart robotd" offer over a video setting is an edit that reads as having
-//! done nothing at all. [`unit_for`] is that mapping and [`units_for`] applies it.
+//! Mostly, not always, and the exceptions are where offering a restart is worst. `padd` re-reads
+//! `[pad]`, `[pad_imu_head_control]` and `[pad_drive]` a second after the file changes, so a restart there drops the pad
+//! session — and robotd's deadman with it — to apply what would have applied by itself. `robotd`
+//! re-reads `[policy]` on a call, so a restart there takes motor control away from a standing
+//! robot to change a number it would have taken standing up.
+//!
+//! [`Apply`] is what a key needs, [`apply_for`] is the mapping, and [`Plan`] is that answer for a
+//! set of keys — what to restart, what to reload, and what needs nothing at all.
 //!
 //! The file is root-owned; run as `sudo robotctl configure` to actually write.
+//!
+//! ## The one row that is not `robotd.toml`
+//!
+//! `allow_dev_daemon`, under `[dev board]` at the top: whether this robot takes branch builds.
+//! It is a marker in `updaterd`'s state directory, not a key in this file
+//! ([`crate::dev_daemon`]), so it is not a [`Row`] and the model never sees it. It saves with
+//! everything else and adds `updaterd` to the restart offer. Absent where there is no
+//! `updater.toml` to find that directory from.
 
-use std::collections::BTreeMap;
-use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use robotd_params::Params;
-use robotd_params::registry::{Entry, Kind, REGISTRY};
-use toml_edit::DocumentMut;
+// The editing model itself lives in `robotd-params`, beside the schema it validates against —
+// see that module's header for why. Re-exported rather than imported privately because the rest
+// of `robotctl` reaches for `configure::Model` and should not have to know it moved.
+pub use robotd_params::edit::{Edit, Model, Row, bind_pad, pad_bindings, render, sections};
 
-/// One key's place in the world: what the file says, what the default is.
-#[derive(Debug, Clone)]
-pub struct Row {
-    pub entry: &'static Entry,
-    /// The value in the file, rendered, if the file sets it.
-    pub set: Option<String>,
-    /// The built-in default, rendered the same way.
-    pub default: String,
-    /// What an *unset* optional key actually resolves to — per mode, per release — when the
-    /// daemon can say. The bare word `unset` told nobody anything.
-    pub resolved: Option<String>,
-}
-
-impl Row {
-    /// What the daemon would actually run with.
-    pub fn effective(&self) -> &str {
-        self.set.as_deref().unwrap_or(&self.default)
-    }
-
-    /// Whether the file overrides the default.
-    pub fn overridden(&self) -> bool {
-        self.set.is_some()
-    }
-
-    /// Whether the value *differs* from the default — the thing worth a colour. A file that
-    /// writes the default out explicitly (the shipped example does) is not a divergence.
-    pub fn differs(&self) -> bool {
-        self.set.as_deref().is_some_and(|set| set != self.default)
-    }
-}
-
-/// A pending edit: set the key to a value, or clear its override.
-#[derive(Debug, Clone)]
-pub enum Edit {
-    Set(toml_edit::Value),
-    Clear,
-}
-
-/// The editable state of one file: the parsed document, and the rows over it.
-pub struct Model {
-    pub path: PathBuf,
-    doc: DocumentMut,
-    defaults: toml::Value,
-    /// Keyed by `section.key`. Applied to the document only on save.
-    pub pending: BTreeMap<&'static str, Edit>,
-    /// What has actually been written, across every save this session.
-    ///
-    /// Kept because `pending` is *cleared* by a save, and what wants restarting is decided after
-    /// the editor has closed — reading `pending` there found nothing every time, so nothing was
-    /// ever restarted and a `[detect]` change looked like a no-op.
-    written: Vec<String>,
-}
-
-impl Model {
-    /// Every key written this session, in the order it was first written.
-    pub fn written(&self) -> &[String] {
-        &self.written
-    }
-
-    /// Load the file — or start from an empty document when there is none, which is a real
-    /// state: a robot may run entirely on defaults with no file at all.
-    pub fn load(path: &Path) -> Result<Self, String> {
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
-        };
-        Self::from_text(path, &text)
-    }
-
-    fn from_text(path: &Path, text: &str) -> Result<Self, String> {
-        // The daemon's own parse first: a file robotd would refuse is not a file to edit
-        // blind, and the error names the line.
-        toml::from_str::<Params>(text).map_err(|e| format!("{}: {e}", path.display()))?;
-        let doc: DocumentMut = text
-            .parse()
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        Ok(Self {
-            path: path.to_path_buf(),
-            doc,
-            defaults: toml::Value::try_from(Params::default()).expect("Params serializes"),
-            pending: BTreeMap::new(),
-            written: Vec::new(),
-        })
-    }
-
-    /// Every key the daemon knows, in registry order, with pending edits shown as if applied.
-    pub fn rows(&self) -> Vec<Row> {
-        REGISTRY
-            .iter()
-            .map(|entry| {
-                let set = match self.pending.get(entry.key) {
-                    Some(Edit::Set(value)) => Some(render(value)),
-                    Some(Edit::Clear) => None,
-                    None => self.file_value(entry.key).map(|v| render(&v)),
-                };
-                let default = self.default_for(entry.key);
-                let resolved = (set.is_none() && default == "unset")
-                    .then(|| self.resolved_hint(entry.key))
-                    .flatten();
-                Row {
-                    entry,
-                    set,
-                    default,
-                    resolved,
-                }
-            })
-            .collect()
-    }
-
-    /// The value the file currently sets for a key, if any.
-    fn file_value(&self, key: &str) -> Option<toml_edit::Value> {
-        let (section, name) = key.split_once('.').expect("registry keys are section.key");
-        self.doc.get(section)?.get(name)?.as_value().cloned()
-    }
-
-    /// The built-in default, rendered — `unset` for the Option fields that resolve elsewhere.
-    fn default_for(&self, key: &str) -> String {
-        let (section, name) = key.split_once('.').expect("registry keys are section.key");
-        match self.defaults.get(section).and_then(|s| s.get(name)) {
-            Some(toml::Value::String(s)) => s.clone(),
-            Some(value) => value.to_string(),
-            // Not serialized: an `Option` at `None`. The registry doc says what unset means.
-            None => "unset".to_owned(),
-        }
-    }
-
-    /// What an unset key resolves to, through the daemon's own resolution — per-mode policy
-    /// defaults, release-relative paths, the mic's mode-dependent switch. Parsed from the
-    /// pending state, so flipping `mode` updates every hint that depends on it.
-    fn resolved_hint(&self, key: &str) -> Option<String> {
-        let params: Params = toml::from_str(&self.rendered()).ok()?;
-        let policy = params.resolved_policy();
-        let path = |p: Option<std::path::PathBuf>| {
-            Some(match p {
-                Some(p) => p.display().to_string(),
-                None => "disabled".to_owned(),
-            })
-        };
-        let float = |f: f64| Some(f.to_string());
-        match key {
-            "policy.walk" => Some(policy.walk.display().to_string()),
-            "policy.stand" => path(policy.stand),
-            "policy.sitstand" => path(policy.sitstand),
-            "policy.ground_pick" => path(policy.ground_pick),
-            "policy.kick_left" => path(policy.kick_left),
-            "policy.kick_right" => path(policy.kick_right),
-            "policy.roulade" => path(policy.roulade),
-            "policy.action_scale" => float(policy.action_scale),
-            "policy.gain" => Some(policy.gain.to_string()),
-            "policy.standing_gain_ratio" => float(policy.standing_gain_ratio),
-            "policy.nominal_voltage" => float(policy.nominal_voltage),
-            "safety.gain_limp" => Some(params.gain_limp().to_string()),
-            "safety.limp_fall_pose_gain" => Some(params.limp_fall_pose_gain().to_string()),
-            "policy.head_lowpass" => policy.head_lowpass.and_then(float),
-            "policy.legs_lowpass" => policy.legs_lowpass.and_then(float),
-            "policy.ground_pick_period" => float(policy.ground_pick_period),
-            "policy.ground_pick_action_scale" => float(policy.ground_pick_action_scale),
-            "media.bitrate" => Some(params.media.bitrate_resolved().to_string()),
-            "audio.pet_detect" => Some(
-                params
-                    .audio
-                    .pet_detect_resolved(params.policy.mode)
-                    .to_string(),
-            ),
-            "audio.pet_model" => path(params.audio.pet_model_resolved()),
-            _ => None,
-        }
-    }
-
-    /// Queue an edit, from the string a user typed or a toggle produced.
-    ///
-    /// Typing the default (or `unset`, for the optional kinds) clears the override instead of
-    /// pinning it — a file full of explicitly-written defaults is the unreadable thing this
-    /// tool exists to avoid.
-    pub fn edit(&mut self, entry: &'static Entry, input: &str) -> Result<(), String> {
-        let input = input.trim();
-        let optional = matches!(
-            entry.kind,
-            Kind::TriBool
-                | Kind::OptionalFloat
-                | Kind::OptionalInteger
-                | Kind::OptionalPath
-                | Kind::OptionalFloatList(_)
-        );
-        if input == self.default_for(entry.key)
-            || (optional && (input == "unset" || input.is_empty()))
-        {
-            self.pending.insert(entry.key, Edit::Clear);
-            return Ok(());
-        }
-        let value: toml_edit::Value = match entry.kind {
-            Kind::Bool | Kind::TriBool => match input {
-                "true" | "on" | "yes" => true.into(),
-                "false" | "off" | "no" => false.into(),
-                _ => return Err(format!("{input:?} is not on/off")),
-            },
-            Kind::Integer | Kind::OptionalInteger => input
-                .parse::<i64>()
-                .map(Into::into)
-                .map_err(|_| format!("{input:?} is not a whole number"))?,
-            Kind::Float | Kind::OptionalFloat => input
-                .parse::<f64>()
-                .map(Into::into)
-                .map_err(|_| format!("{input:?} is not a number"))?,
-            Kind::Choice(choices) => {
-                if !choices.contains(&input) {
-                    return Err(format!("{input:?} is not one of {choices:?}"));
-                }
-                input.into()
-            }
-            Kind::Text | Kind::OptionalPath => input.into(),
-            Kind::IntegerList => {
-                let mut array = toml_edit::Array::new();
-                for word in input.split(',') {
-                    let word = word.trim();
-                    if word.is_empty() {
-                        continue;
-                    }
-                    let number: i64 = word
-                        .parse()
-                        .map_err(|_| format!("{word:?} is not a whole number"))?;
-                    array.push(number);
-                }
-                if array.is_empty() {
-                    return Err("an empty list — give comma-separated numbers".to_owned());
-                }
-                array.into()
-            }
-            Kind::OptionalFloatList(len) => {
-                let mut array = toml_edit::Array::new();
-                for word in input.split(',') {
-                    let word = word.trim();
-                    if word.is_empty() {
-                        continue;
-                    }
-                    let number: f64 = word
-                        .parse()
-                        .map_err(|_| format!("{word:?} is not a number"))?;
-                    if !number.is_finite() {
-                        return Err(format!("{word:?} is not a finite number"));
-                    }
-                    array.push(number);
-                }
-                if array.len() != len as usize {
-                    return Err(format!(
-                        "need {len} numbers, got {} — comma-separated degrees, one per joint",
-                        array.len()
-                    ));
-                }
-                array.into()
-            }
-        };
-        self.pending.insert(entry.key, Edit::Set(value));
-        Ok(())
-    }
-
-    /// The next value a toggle key produces — what SPACE does. `None` for kinds that want
-    /// typed input instead.
-    pub fn toggled(&self, row: &Row) -> Option<String> {
-        match row.entry.kind {
-            Kind::Bool => Some(
-                if row.effective() == "true" {
-                    "false"
-                } else {
-                    "true"
-                }
-                .into(),
-            ),
-            // auto → on → off → auto. `unset` is the auto state.
-            Kind::TriBool => Some(match (row.overridden(), row.effective()) {
-                (false, _) => "true".into(),
-                (true, "true") => "false".into(),
-                (true, _) => "unset".into(),
-            }),
-            Kind::Choice(choices) => {
-                let current = row.effective();
-                let at = choices.iter().position(|c| *c == current).unwrap_or(0);
-                Some(choices[(at + 1) % choices.len()].into())
-            }
-            _ => None,
-        }
-    }
-
-    /// The document with every pending edit applied, as text — what save writes.
-    ///
-    /// Comments and unknown keys survive untouched: `toml_edit` only changes what is set or
-    /// removed, and clearing a key removes the key alone, never its section or its comments.
-    pub fn rendered(&self) -> String {
-        let mut doc = self.doc.clone();
-        for (key, edit) in &self.pending {
-            let (section, name) = key.split_once('.').expect("section.key");
-            match edit {
-                Edit::Set(value) => {
-                    let table = doc
-                        .entry(section)
-                        .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
-                    table[name] = toml_edit::Item::Value(value.clone());
-                }
-                Edit::Clear => {
-                    if let Some(table) = doc.get_mut(section).and_then(|i| i.as_table_mut()) {
-                        table.remove(name);
-                    }
-                }
-            }
-        }
-        doc.to_string()
-    }
-
-    /// Validate the pending edits through the daemon's own gate, then write atomically.
-    ///
-    /// Validation goes through a real file and [`Params::load`] rather than a bare parse,
-    /// because `load` is what `robotd` runs at startup — range checks included. What this tool
-    /// writes, the daemon starts on.
-    pub fn save(&mut self) -> Result<(), String> {
-        let text = self.rendered();
-        let staged = self.path.with_extension("toml.new");
-        let write = |path: &Path| -> std::io::Result<()> {
-            let mut file = std::fs::File::create(path)?;
-            file.write_all(text.as_bytes())?;
-            file.sync_all()
-        };
-        write(&staged).map_err(|e| writable_hint(&staged, &e))?;
-        if let Err(e) = Params::load(&staged, true) {
-            let _ = std::fs::remove_file(&staged);
-            return Err(format!(
-                "refusing to write a config robotd would reject: {e}"
-            ));
-        }
-        std::fs::rename(&staged, &self.path).map_err(|e| writable_hint(&self.path, &e))?;
-        // The document on disk is now the rendered one; fold the edits in.
-        self.doc = text.parse().expect("just validated");
-        for key in self.pending.keys() {
-            let key = (*key).to_owned();
-            if !self.written.contains(&key) {
-                self.written.push(key);
-            }
-        }
-        self.pending.clear();
-        Ok(())
-    }
-}
-
-/// A value as the UI shows it — the data alone. Strings lose their quotes, and everything
-/// loses its decor: `to_string` on a `toml_edit` value carries the whitespace and any inline
-/// comment along, which is how `50 # do not touch` once ended up in a value cell.
-fn render(value: &toml_edit::Value) -> String {
-    match value {
-        toml_edit::Value::String(s) => s.value().clone(),
-        toml_edit::Value::Integer(v) => v.value().to_string(),
-        toml_edit::Value::Float(v) => v.value().to_string(),
-        toml_edit::Value::Boolean(v) => v.value().to_string(),
-        toml_edit::Value::Datetime(v) => v.value().to_string(),
-        other => {
-            let mut bare = other.clone();
-            bare.decor_mut().clear();
-            bare.to_string().trim().to_owned()
-        }
-    }
-}
-
-/// Sections in registry order, for headers.
-pub fn sections() -> Vec<&'static str> {
-    let mut out: Vec<&'static str> = Vec::new();
-    for entry in REGISTRY {
-        let section = entry.key.split_once('.').expect("section.key").0;
-        if out.last() != Some(&section) {
-            out.push(section);
-        }
-    }
-    out
-}
-
-/// Permission errors get the actual fix, because the file is root-owned by design.
-fn writable_hint(path: &Path, e: &std::io::Error) -> String {
-    if e.kind() == std::io::ErrorKind::PermissionDenied {
-        format!(
-            "cannot write {}: permission denied — run `sudo robotctl configure`",
-            path.display()
-        )
-    } else {
-        format!("cannot write {}: {e}", path.display())
-    }
-}
-
-/// Which daemon reads a section, and so which unit a change to it needs restarted.
+/// What a written key needs before the daemon that reads it is running on it.
 ///
-/// `robotd` parses this file for itself; `[media]` and `[detect]` are `mediad` reading the same
-/// file, because a per-board setting belongs in the per-board config rather than on a unit file the
-/// release installer rewrites — and because the camera frames `[detect]` is about are on `mediad`'s
-/// tee. Being wrong here is an edit that appears to do nothing until the next reboot — which is
-/// exactly what the restart offer exists to prevent, so it is derived from the keys that changed
-/// rather than assumed.
-fn unit_for(section: &str) -> &'static str {
-    match section {
-        "media" | "detect" => "mediad",
-        _ => "robotd",
+/// Every variant names that daemon, because every message the exit flow prints names it: an offer
+/// that says "restart" without saying *what* is how `[head_imu]` came to restart `robotd`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Apply {
+    /// Read once at startup. The unit has to go down and come back, and everything it was doing
+    /// stops for as long as that takes.
+    Restart(&'static str),
+    /// A running daemon will re-read it on a call. Cheaper than a restart in the way that
+    /// matters: the motors stay powered.
+    Reload(&'static str),
+    /// The daemon re-reads the file by itself. Nothing to do but say so.
+    Live(&'static str),
+    /// Read once per boot by something that is not running now. A restart would apply nothing,
+    /// so there is nothing to offer — only the reboot to name.
+    NextBoot(&'static str),
+}
+
+impl Apply {
+    /// The daemon, whatever the answer was.
+    fn unit(self) -> &'static str {
+        match self {
+            Self::Restart(unit) | Self::Reload(unit) | Self::Live(unit) | Self::NextBoot(unit) => {
+                unit
+            }
+        }
     }
 }
 
-/// The units a set of `section.key` names requires restarting, in start order, without duplicates.
-fn units_for_keys<'a>(keys: impl Iterator<Item = &'a str>) -> Vec<&'static str> {
+/// What a change to `section.key` needs, and from which daemon.
+///
+/// `robotd` parses this file for itself; `[media]` and `[duck_detector]` are `mediad` reading the same
+/// file, because a per-board setting belongs in the per-board config rather than on a unit file the
+/// release installer rewrites — and because the camera frames `[duck_detector]` is about are on `mediad`'s
+/// tee. Being wrong here is an edit that appears to do nothing until the next reboot — which is
+/// exactly what the offer exists to prevent, so it is derived from the keys that changed rather
+/// than assumed.
+///
+/// **Every section is listed, and there is no fallback.** `[head_imu]` shipped reading as `robotd`
+/// because a `_ => "robotd"` arm answered for it: enabling the head IMU restarted the daemon that
+/// does not read the key and left `tofd` on the old value, so the switch did nothing and said
+/// nothing. A section with no arm here now fails `every_registry_key_says_how_it_applies` rather
+/// than picking up whichever daemon the catch-all happened to name.
+///
+/// Keyed by the whole `section.key` rather than the section because `[policy]` is not of one
+/// mind: the daemon re-reads that section on a call, all of it but the two keys below.
+fn apply_for(key: &str) -> Option<Apply> {
+    let (section, name) = key.split_once('.')?;
+    Some(match section {
+        "media" | "duck_detector" => Apply::Restart("mediad"),
+        // `updaterd` reads the board before every check, for the hardware revision a release is
+        // checked against (`robotd_params::board::Board::declared`). Nothing else reads it yet.
+        "board" => Apply::Live("updaterd"),
+        "platform" | "imu" => Apply::Restart("robotd"),
+        "policy" if name == "home" => Apply::Restart("robotd"),
+        // `padd` stats the file once a second and re-reads its sections when the mtime
+        // moves — `padd/src/main.rs`, where the reload is a line above `tap.imu_control()` and
+        // says why it is on every tick. So there is nothing to offer, and offering a restart
+        // anyway is not free: the pad session goes with it, and robotd's deadman zeroes the
+        // velocity of whatever was walking. `robotctl pad bind` has always said the true thing —
+        // "padd picks this up within a second".
+        //
+        // `pad_imu_head_control` is the *controller's* IMU steering the head. Not `head_imu` below.
+        "pad"
+        | "pad_imu_head_control"
+        | "pad_drive"
+        | "pad_axes"
+        | "pad_head"
+        | "pad_body"
+        | "pad_roller" => Apply::Live("padd"),
+        // Whichever daemon reads this board's head IMU, once, at startup: `tofd` for the
+        // `zero3`'s BMI088 (it shares the HAT's bus with the ToF; `tof/src/config.rs` says why
+        // it reads robotd's file), `robotd` for the `beta`'s LSM6DSV16X. The board is the
+        // hardware this editor is running on, which is the one whose daemon has to restart.
+        "head_imu" => Apply::Restart(robotd_params::HeadImuParams::reader(
+            robotd_params::board::Board::detected().unwrap_or_default(),
+        )),
+        // `[policy]` is the one section a running daemon takes back: `PolicyChange::Reload`
+        // re-reads it whole and rebuilds the controller from it, which is how `robotctl policy
+        // add` lands a skill without a restart. Two keys are not in that promise:
+        //
+        // - `mode` is deliberately kept across a reload, because `robot.setMode` does not write
+        //   config and adopting the file's mode would undo a live switch as a side effect.
+        // - `enabled` is read once into `RobotState`, and the reload call is *refused* while it
+        //   is false — so the one direction anybody cares about, off to on, cannot be a reload.
+        // `allow_community` is not `robotd`'s at all: `updaterd` reads it before every fetch
+        // (`PolicyParams::community_allowed`), the way it reads the board.
+        "policy" if name == "allow_community" => Apply::Live("updaterd"),
+        "policy" if name != "mode" && name != "enabled" && name != "home" => {
+            Apply::Reload("robotd")
+        }
+        // Read once at startup by both `padd` and `netpadd`, each to decide whether it is the one
+        // to run (`--should-run`). `apply_for` names one daemon; `plan_for_keys` adds `padd`.
+        "netpad" => Apply::Restart("netpadd"),
+        // The boot check's, not robotd's: `scripts/robot-boot-check` reads it once per boot, and
+        // offering a robotd restart for it would be an edit that appears to do something.
+        "update_gate" if name == "boot_deadline_s" => Apply::NextBoot("robot-boot-check"),
+        // `updaterd` reads it at the moment it would revert, the way it reads `allow_community`;
+        // the boot check reads it once per boot, as it does `boot_deadline_s`. Neither is robotd.
+        "update_gate" if name == "auto_rollback" => Apply::Live("updaterd"),
+        // `robotd`'s laser reader re-reads `[laser]` within a second of the file changing —
+        // tuning it is many small edits, and each must not drop the robot. `enabled` included:
+        // an edit to it switches tracking there and then.
+        "laser" => Apply::Live("robotd"),
+        "bus" | "control" | "update_gate" | "policy" | "safety" | "chorale" | "idle"
+        | "theremin" | "pickup" | "audio" | "emotions" => Apply::Restart("robotd"),
+        _ => return None,
+    })
+}
+
+/// What a set of written keys needs, with each daemon named once.
+///
+/// Separate lists rather than one, because the answers read differently on the way out: a
+/// restart is a question, a reload is a lighter question, and `live` and `next_boot` are answers
+/// — the operator is told when it applies and asked nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Plan {
+    /// Units to restart, in start order.
+    pub restart: Vec<&'static str>,
+    /// Units to ask for a re-read.
+    pub reload: Vec<&'static str>,
+    /// Units that have it already, or will within a second.
+    pub live: Vec<&'static str>,
+    /// What reads it at the next boot, and not before.
+    pub next_boot: Vec<&'static str>,
+}
+
+impl Plan {
+    /// Is there nothing to ask the operator?
+    ///
+    /// True for no edits at all *and* for edits that are already live or wait for a boot — the
+    /// difference is `live` and `next_boot`, and the caller says those things differently.
+    pub fn is_quiet(&self) -> bool {
+        self.restart.is_empty() && self.reload.is_empty()
+    }
+}
+
+/// What a set of `section.key` names needs, in the order the exit flow acts on it.
+fn plan_for_keys<'a>(keys: impl Iterator<Item = &'a str>) -> Plan {
+    let mut plan = Plan::default();
+    for key in keys {
+        // Unreachable for a registry key: `every_registry_key_says_how_it_applies` keeps
+        // `apply_for` exhaustive. Saying nothing beats naming the wrong daemon — the exit path
+        // then prints the file it wrote instead of restarting something that never reads it.
+        let Some(apply) = apply_for(key) else {
+            continue;
+        };
+        let list = match apply {
+            Apply::Restart(_) => &mut plan.restart,
+            Apply::Reload(_) => &mut plan.reload,
+            Apply::Live(_) => &mut plan.live,
+            Apply::NextBoot(_) => &mut plan.next_boot,
+        };
+        if !list.contains(&apply.unit()) {
+            list.push(apply.unit());
+        }
+        // The other half of `[netpad]`: restarting only `netpadd` leaves `padd` on the old answer.
+        if key.starts_with("netpad.") && !plan.restart.contains(&"padd") {
+            plan.restart.push("padd");
+        }
+    }
+    // A daemon that is going down anyway reads the whole file coming back up, so the weaker
+    // answers for it are absorbed rather than listed. `[policy] mode` with `[policy] gain` is
+    // exactly that shape: mode needs the restart, gain would have been a reload, and offering
+    // "restart robotd, then reload robotd" would disturb a walking robot a second time to apply
+    // what it already applied.
+    plan.reload.retain(|unit| !plan.restart.contains(unit));
+    plan.live
+        .retain(|unit| !plan.restart.contains(unit) && !plan.reload.contains(unit));
     // `robotd` first, because `mediad.service` is `After=robotd.service`: restarting in the
     // other order means mediad reconnects to a robotd that is about to go away.
-    let mut units: Vec<&'static str> = Vec::new();
-    for key in keys {
-        let (section, _) = key.split_once('.').expect("registry keys are section.key");
-        let unit = unit_for(section);
-        if !units.contains(&unit) {
-            units.push(unit);
-        }
-    }
-    units.sort_unstable_by_key(|unit| *unit != "robotd");
-    units
+    plan.restart.sort_unstable_by_key(|unit| *unit != "robotd");
+    plan
 }
 
-/// The units the pending edits require restarting, in start order, without duplicates.
+/// What the pending edits need.
 ///
-/// Empty is a real answer — no edits, nothing to restart — and the caller must not offer a
-/// restart for it. Read *before* a save, which clears the pending map.
-pub fn units_for(model: &Model) -> Vec<&'static str> {
-    units_for_keys(model.pending.keys().copied())
+/// A quiet plan is a real answer — no edits, or edits nobody has to do anything about — and the
+/// caller must not offer a restart for it. Read *before* a save, which clears the pending map.
+pub fn plan_for(model: &Model) -> Plan {
+    plan_for_keys(model.pending.keys().copied())
 }
 
-/// The daemons that read the keys somebody just changed.
+/// What the keys somebody just changed need.
 ///
-/// The same mapping as [`units_for`], from what a save recorded rather than from what is still
+/// The same mapping as [`plan_for`], from what a save recorded rather than from what is still
 /// pending — which is what the exit flow has to work from, because the save already cleared the
 /// other one.
-pub fn units_to_restart(edited: &[String]) -> Vec<&'static str> {
-    units_for_keys(edited.iter().map(String::as_str))
+pub fn plan_for_written(edited: &[String]) -> Plan {
+    plan_for_keys(edited.iter().map(String::as_str))
 }
 
 /// Restart units, reporting rather than hiding the outcome.
@@ -520,6 +291,80 @@ pub fn summary(model: &Model) -> Vec<String> {
         .collect()
 }
 
+/// Print what this robot's config changes, and nothing else.
+///
+/// **"What has been changed on this robot" is the first question support asks**, and until now
+/// the only way to answer it was the editor — a full-screen TUI, over ssh, on a robot somebody is
+/// already having trouble with. The comparison was there all along; it was just unreachable
+/// without taking over the terminal.
+///
+/// Divergences only, because that is the question. The shipped file sets four keys and comments
+/// out the rest, so a robot that has never been touched prints nothing at all — which is itself
+/// the answer, and a shorter one than a hundred lines of defaults.
+///
+/// A key written out with its default value is *not* a divergence and does not appear. The
+/// shipped file does exactly that in places, and reporting it as a change would bury the two
+/// lines that matter under the ones that do not.
+pub fn list(path: &Path, json: bool) -> Result<(), String> {
+    let model = Model::load(path)?;
+    if let Some(note) = ignored_note(&model) {
+        // Yellow on a terminal, as in the editor: ignored is not an error.
+        if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+            eprintln!("\x1b[33m{note}\x1b[0m");
+        } else {
+            eprintln!("{note}");
+        }
+    }
+    let changed: Vec<Row> = model.rows().into_iter().filter(Row::differs).collect();
+
+    if json {
+        let entries: Vec<serde_json::Value> = changed
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "key": row.entry.key,
+                    "value": row.effective(),
+                    "default": row.default,
+                    "doc": row.entry.doc,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string(&entries).map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
+
+    if changed.is_empty() {
+        println!(
+            "{} changes nothing — every value is the default",
+            path.display()
+        );
+        return Ok(());
+    }
+
+    let width = changed
+        .iter()
+        .map(|row| row.entry.key.len())
+        .max()
+        .unwrap_or(0);
+    for row in &changed {
+        println!(
+            "{:width$}  {}  (default {})",
+            row.entry.key,
+            row.effective(),
+            row.default
+        );
+    }
+    println!(
+        "\n{} {} differ from the default. `sudo robotctl configure` edits them; `u` reverts one.",
+        changed.len(),
+        if changed.len() == 1 { "key" } else { "keys" }
+    );
+    Ok(())
+}
+
 // ── the terminal UI ──────────────────────────────────────────────────────────
 //
 // One screen: feature switches first, then every section; a footer carrying the selected
@@ -527,17 +372,37 @@ pub fn summary(model: &Model) -> Vec<String> {
 // `monitor`'s conventions (ratatui, `ratatui::init`/`restore`) and deliberately dumber — a
 // config editor should feel like a settings menu, not a dashboard.
 
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-/// What the list shows at one line: a section header, or a key.
+/// What the list shows at one line: a section header, a key, or the dev-board switch — which is
+/// not in `robotd.toml` and so not a [`Row`] ([`crate::dev_daemon::Switch`]).
 #[derive(Debug)]
 enum Item {
     Header(&'static str),
     Key(usize),
+    DevDaemon,
+}
+
+/// The header the dev-board switch sits under, at the top of the list.
+const DEV_HEADER: &str = "dev board";
+
+/// Is the dev-board switch toggled and not yet saved?
+fn dev_pending(switch: Option<&crate::dev_daemon::Switch>) -> bool {
+    switch.is_some_and(|switch| switch.pending.is_some())
+}
+
+/// The list with the dev-board switch at the top, where there is one.
+fn with_dev_row(items: Vec<Item>, switch: Option<&crate::dev_daemon::Switch>) -> Vec<Item> {
+    if switch.is_none() {
+        return items;
+    }
+    let mut out = vec![Item::Header(DEV_HEADER), Item::DevDaemon];
+    out.extend(items);
+    out
 }
 
 /// Where input goes right now.
@@ -549,27 +414,66 @@ enum Focus {
         buffer: String,
         error: Option<String>,
     },
+    /// Fuzzy-searching the list from a popup (ctrl+f). The cursor follows the best match as
+    /// the query grows; leaving the popup — ENTER or ESC alike — keeps it wherever it landed.
+    Search {
+        query: String,
+        /// Where the cursor was when the popup opened: an emptied query goes back there.
+        origin: usize,
+        /// Which of the ranked hits the cursor sits on (↑↓ walk them).
+        hit: usize,
+    },
     /// Deciding what to do with the pending edits on the way out.
     Confirm,
-    /// Everything written; offering the restart every change requires — of the daemons that
-    /// actually read what changed, which is not always `robotd`.
-    Restart { units: Vec<&'static str> },
+    /// Everything written; offering what the change actually needs — of the daemons that
+    /// actually read what changed, which is not always `robotd` and is not always a restart.
+    /// Never reached for a [`Plan::is_quiet`] plan: there is nothing to ask.
+    Apply { plan: Plan },
+}
+
+/// What to say about keys the files set and this build does not know — typically left by a
+/// branch the robot ran before. Kept in the file and ignored, exactly as `robotd` does. The
+/// base's are named with the base, since that is the file to open to drop one.
+fn ignored_note(model: &Model) -> Option<String> {
+    let mut parts = Vec::new();
+    if !model.ignored().is_empty() {
+        parts.push(model.ignored().join(", "));
+    }
+    if let Some((base, keys)) = model.ignored_in_base() {
+        parts.push(format!("{} (in {})", keys.join(", "), base.display()));
+    }
+    (!parts.is_empty()).then(|| {
+        format!(
+            "ignored, unknown to this build (kept in the file): {}",
+            parts.join("; ")
+        )
+    })
 }
 
 /// Run the editor. Returns once the user has left, with everything saved or discarded.
-pub fn run(path: &Path) -> Result<(), String> {
+///
+/// `robot_socket` is only reached for a `[policy]` change, and only if the operator accepts the
+/// reload — the editor is useful on a board where nothing is running.
+///
+/// `updater_config` is where the dev-board switch is read from; with no `updaterd` there, the
+/// editor simply has no such row.
+pub fn run(path: &Path, robot_socket: &Path, updater_config: &Path) -> Result<(), String> {
     // An interactive editor and nothing else: piped in or out, there is no sensible
     // behaviour to fall back to, and ratatui would panic trying to open the terminal.
     if !crate::monitor::stdout_is_a_terminal() {
         return Err("configure is interactive — run it in a terminal".to_owned());
     }
     let mut model = Model::load(path)?;
-    let items = layout_items(&model);
+    let mut dev = crate::dev_daemon::Switch::load(updater_config);
+    let items = with_dev_row(layout_items(&model), dev.as_ref());
     // First key, not the first header.
     let mut cursor = items
         .iter()
-        .position(|item| matches!(item, Item::Key(_)))
+        .position(|item| !matches!(item, Item::Header(_)))
         .unwrap_or(0);
+    // Whether the save wrote the dev-board switch — the part of the exit flow `model.written()`
+    // cannot know about.
+    let mut dev_written = false;
     let mut focus = Focus::List;
     let mut saved = false;
     let mut status: Option<String> = None;
@@ -586,6 +490,7 @@ pub fn run(path: &Path) -> Result<(), String> {
                 cursor,
                 &focus,
                 status.as_deref(),
+                dev.as_ref(),
             );
         }) {
             break Err(format!("terminal: {e}"));
@@ -602,13 +507,18 @@ pub fn run(path: &Path) -> Result<(), String> {
         match &mut focus {
             Focus::List => match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => {
-                    if model.pending.is_empty() {
+                    if model.pending.is_empty() && !dev_pending(dev.as_ref()) {
                         break Ok(saved);
                     }
                     focus = Focus::Confirm;
                 }
                 KeyCode::Up | KeyCode::Char('k') => cursor = step(&items, cursor, -1),
                 KeyCode::Down | KeyCode::Char('j') => cursor = step(&items, cursor, 1),
+                KeyCode::Char(' ') | KeyCode::Enter if matches!(items[cursor], Item::DevDaemon) => {
+                    if let Some(switch) = dev.as_mut() {
+                        switch.toggle();
+                    }
+                }
                 KeyCode::Char(' ') => {
                     if let Item::Key(index) = items[cursor] {
                         let row = &rows[index];
@@ -621,7 +531,7 @@ pub fn run(path: &Path) -> Result<(), String> {
                             }
                             None => {
                                 focus = Focus::Editing {
-                                    buffer: row.effective().to_owned(),
+                                    buffer: shown_value(row).to_owned(),
                                     error: None,
                                 };
                             }
@@ -631,16 +541,29 @@ pub fn run(path: &Path) -> Result<(), String> {
                 KeyCode::Enter => {
                     if let Item::Key(index) = items[cursor] {
                         focus = Focus::Editing {
-                            buffer: rows[index].effective().to_owned(),
+                            buffer: shown_value(&rows[index]).to_owned(),
                             error: None,
                         };
                     }
                 }
-                KeyCode::Char('u') | KeyCode::Char('d') => {
-                    if let Item::Key(index) = items[cursor] {
+                KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    focus = Focus::Search {
+                        query: String::new(),
+                        origin: cursor,
+                        hit: 0,
+                    };
+                }
+                KeyCode::Char('u') | KeyCode::Char('d') => match items[cursor] {
+                    Item::Key(index) => {
                         model.pending.insert(rows[index].entry.key, Edit::Clear);
                     }
-                }
+                    Item::DevDaemon => {
+                        if let Some(switch) = dev.as_mut() {
+                            switch.revert();
+                        }
+                    }
+                    Item::Header(_) => {}
+                },
                 _ => {}
             },
             Focus::Editing { buffer, error } => match key.code {
@@ -663,15 +586,68 @@ pub fn run(path: &Path) -> Result<(), String> {
                 }
                 _ => {}
             },
+            Focus::Search { query, origin, hit } => {
+                match key.code {
+                    // Both leave the selection where the search put it: the point of the
+                    // search was to get there.
+                    KeyCode::Esc | KeyCode::Enter => {
+                        focus = Focus::List;
+                        continue;
+                    }
+                    KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        focus = Focus::List;
+                        continue;
+                    }
+                    KeyCode::Down | KeyCode::Tab => *hit += 1,
+                    KeyCode::Up | KeyCode::BackTab => *hit = hit.saturating_sub(1),
+                    KeyCode::Backspace => {
+                        query.pop();
+                        *hit = 0;
+                    }
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        query.push(c);
+                        *hit = 0;
+                    }
+                    _ => {}
+                }
+                if query.is_empty() {
+                    cursor = *origin;
+                } else {
+                    let hits = search(&items, &rows, query);
+                    if !hits.is_empty() {
+                        *hit = (*hit).min(hits.len() - 1);
+                        cursor = hits[*hit];
+                    }
+                }
+            }
             Focus::Confirm => match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => {
                     // Read before the save, which clears `pending` — after it there is nothing
                     // left to say which daemons were affected.
-                    let units = units_for(&model);
-                    match model.save() {
+                    let mut plan = plan_for(&model);
+                    if dev_pending(dev.as_ref()) {
+                        plan.restart.push("updaterd");
+                    }
+                    let result = if model.pending.is_empty() {
+                        Ok(())
+                    } else {
+                        model.save()
+                    };
+                    // The marker after the file: a rejected `robotd.toml` leaves the switch
+                    // pending too, so a retry writes both or neither.
+                    let result = result.and_then(|()| match dev.as_mut() {
+                        Some(switch) => switch.save().map(|changed| dev_written |= changed),
+                        None => Ok(()),
+                    });
+                    match result {
                         Ok(()) => {
                             saved = true;
-                            focus = Focus::Restart { units };
+                            if plan.is_quiet() {
+                                // `padd` has it, or will within a second. Asking would be
+                                // asking somebody to authorise a pad restart for nothing.
+                                break Ok(true);
+                            }
+                            focus = Focus::Apply { plan };
                         }
                         Err(e) => {
                             status = Some(e);
@@ -683,10 +659,12 @@ pub fn run(path: &Path) -> Result<(), String> {
                 KeyCode::Esc => focus = Focus::List,
                 _ => {}
             },
-            Focus::Restart { .. } => match key.code {
+            Focus::Apply { .. } => match key.code {
                 // The restart itself happens after `ratatui::restore`, outside the alternate
                 // screen, so systemctl's output is visible.
                 KeyCode::Char('y') | KeyCode::Enter => break Ok(true),
+                // Back to `List` so the tail below finds no plan to act on — declining has to
+                // leave the same trace as never having been asked.
                 KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => {
                     focus = Focus::List;
                     break Ok(saved);
@@ -695,9 +673,10 @@ pub fn run(path: &Path) -> Result<(), String> {
             },
         }
     };
-    let restart_wanted = match &focus {
-        Focus::Restart { units } => units.clone(),
-        _ => Vec::new(),
+    // What the operator agreed to on the way out — nothing, unless they were asked and said yes.
+    let agreed = match &focus {
+        Focus::Apply { plan } => plan.clone(),
+        _ => Plan::default(),
     };
     // What was *written*, not what is pending: the save already happened inside the loop above and
     // cleared the pending map, which is why reading it here restarted nothing at all.
@@ -705,17 +684,86 @@ pub fn run(path: &Path) -> Result<(), String> {
     ratatui::restore();
 
     let saved = outcome?;
-    if !restart_wanted.is_empty() {
-        let names = restart_wanted.join(" and ");
+    if !saved {
+        return Ok(());
+    }
+
+    if dev_written {
+        if dev.as_ref().is_some_and(|switch| switch.on) {
+            println!(
+                "this robot is now a dev board — install a branch build with\n  \
+                 sudo robotctl update apply --ref <branch> daemon\n\
+                 (without --ref or --version, `update apply` installs the latest stable release)"
+            );
+        } else {
+            println!("this robot is no longer a dev board");
+        }
+    }
+
+    if !agreed.restart.is_empty() {
+        let names = agreed.restart.join(" and ");
         println!("restarting {names}…");
-        restart_units(&restart_wanted)?;
+        restart_units(&agreed.restart)?;
         println!("{names} restarted");
-    } else if saved {
-        let names = units_to_restart(&edited).join(" and ");
-        println!(
-            "written to {} — changes apply on the next `systemctl restart {names}`",
-            path.display()
-        );
+    }
+    for unit in &agreed.reload {
+        // `robotd` is the only unit that can be here — `[policy]` is the one section a running
+        // daemon takes back, and `reload_policies` is that one call — so the name is read off
+        // the plan for the message and asserted rather than dispatched on.
+        debug_assert_eq!(*unit, "robotd", "robotd owns the only reloadable section");
+        println!("asking {unit} to re-read the config…");
+        match crate::reload_policies(robot_socket) {
+            Ok(true) => println!("{unit} is running on the new values"),
+            Ok(false) => println!(
+                "{unit} declined — policies are off on this robot, which takes a restart:\n  \
+                 sudo systemctl restart {unit}"
+            ),
+            Err(e) => {
+                println!("{unit} did not answer ({e}) — it will read the file at its next start")
+            }
+        }
+    }
+    if agreed.is_quiet() {
+        // Declined, or never asked. Say where the change is and what it is waiting on, since
+        // the two answers are different and only one of them is a thing to do.
+        let mut plan = plan_for_written(&edited);
+        if dev_written {
+            plan.restart.push("updaterd");
+        }
+        if !edited.is_empty() {
+            println!("written to {}", path.display());
+        }
+
+        if !plan.restart.is_empty() {
+            println!(
+                "  applies on:  sudo systemctl restart {}",
+                plan.restart.join(" ")
+            );
+        }
+        if !plan.reload.is_empty() {
+            // No command to name: the reload is a call this editor makes, and `robotctl policy`
+            // makes it as a side effect of its own writes. What is worth saying is that nothing
+            // is running on the new value yet.
+            println!(
+                "  {} has it at its next start — nothing is running on it yet",
+                plan.reload.join(" and ")
+            );
+        }
+        if !plan.live.is_empty() {
+            let names = plan.live.join(" and ");
+            let reads = if plan.live.len() == 1 {
+                "picks"
+            } else {
+                "pick"
+            };
+            println!("  {names} {reads} this up within a second — nothing to restart");
+        }
+        if !plan.next_boot.is_empty() {
+            println!(
+                "  {} reads this at the next boot — nothing to restart",
+                plan.next_boot.join(" and ")
+            );
+        }
     }
     Ok(())
 }
@@ -753,6 +801,115 @@ fn layout_items(model: &Model) -> Vec<Item> {
     items
 }
 
+/// The value the list draws for a row — and so the one an edit should start from. An optional
+/// key left unset shows what it *resolves* to, `0.9 (auto)`; opening the editor on the literal
+/// word `unset` instead meant erasing it before every edit.
+fn shown_value(row: &Row) -> &str {
+    match &row.resolved {
+        Some(resolved) if !row.differs() => resolved,
+        _ => row.effective(),
+    }
+}
+
+/// Everything the list shows for one key, joined so a query can hit any of it: section, name,
+/// the value as drawn, the default, and the one-line doc.
+fn searchable(row: &Row) -> String {
+    let (section, name) = row.entry.key.split_once('.').expect("section.key");
+    format!(
+        "{section} {name} {} {} {}",
+        shown_value(row),
+        row.default,
+        row.entry.doc
+    )
+}
+
+/// Item indices of every key matching `query`, best first. Ties keep list order, so a query
+/// that fits several keys equally walks them top to bottom.
+fn search(items: &[Item], rows: &[Row], query: &str) -> Vec<usize> {
+    let mut hits: Vec<(i32, usize)> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(at, item)| match item {
+            Item::Key(index) => Some((row_score(&rows[*index], query)?, at)),
+            Item::DevDaemon => Some((dev_score(query)?, at)),
+            Item::Header(_) => None,
+        })
+        .collect();
+    hits.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    hits.into_iter().map(|(_, at)| at).collect()
+}
+
+/// How well one row answers `query`, or `None`. Every whitespace-separated word must hit; a
+/// word hits when it is *typed into* the key name (subsequence, `actsc` → `action_scale`), or
+/// appears verbatim anywhere else the row shows — section, value, default, doc. Only the name
+/// gets the fuzzy treatment: letters in order across a sentence of doc match nearly every row,
+/// which is what made `tof` land on `theremin.enabled` with forty hits behind it.
+fn row_score(row: &Row, query: &str) -> Option<i32> {
+    let name = row.entry.key.split_once('.').expect("section.key").1;
+    let text = searchable(row).to_lowercase();
+    let mut total = 0;
+    for word in query.split_whitespace() {
+        let lower = word.to_lowercase();
+        total += if let Some(at) = name.to_lowercase().find(&lower) {
+            let word_start = at == 0 || !name.as_bytes()[at - 1].is_ascii_alphanumeric();
+            300 + if word_start { 20 } else { 0 } - at as i32
+        } else if let Some(score) = fuzzy_score(word, name) {
+            100 + score
+        } else {
+            let at = text.find(&lower)?;
+            50 - (at / 10) as i32
+        };
+    }
+    Some(total)
+}
+
+/// [`row_score`] for the dev-board switch: typed into its name, or verbatim in its header or doc.
+fn dev_score(query: &str) -> Option<i32> {
+    use crate::dev_daemon::Switch;
+    let text = format!("{DEV_HEADER} {}", Switch::DOC).to_lowercase();
+    let mut total = 0;
+    for word in query.split_whitespace() {
+        let lower = word.to_lowercase();
+        total += if let Some(at) = Switch::NAME.find(&lower) {
+            let word_start = at == 0 || !Switch::NAME.as_bytes()[at - 1].is_ascii_alphanumeric();
+            300 + if word_start { 20 } else { 0 } - at as i32
+        } else if let Some(score) = fuzzy_score(word, Switch::NAME) {
+            100 + score
+        } else {
+            50 - (text.find(&lower)? / 10) as i32
+        };
+    }
+    Some(total)
+}
+
+/// Case-insensitive subsequence match, scored: `None` if the letters of `needle` do not occur
+/// in order in `hay`; otherwise higher is better — runs of adjacent matches and matches at word
+/// starts (`_`, space, `.`) score well, gaps cost a little. Only ever run over a key name, which
+/// is short enough for a subsequence to mean something.
+fn fuzzy_score(needle: &str, hay: &str) -> Option<i32> {
+    let needle: Vec<char> = needle.chars().flat_map(char::to_lowercase).collect();
+    let hay: Vec<char> = hay.chars().flat_map(char::to_lowercase).collect();
+    if needle.is_empty() {
+        return Some(0);
+    }
+    let mut score = 0i32;
+    let mut at = 0usize;
+    let mut previous: Option<usize> = None;
+    for &c in &needle {
+        let found = hay[at..].iter().position(|&h| h == c)? + at;
+        let word_start = found == 0 || !hay[found - 1].is_alphanumeric();
+        score += match previous {
+            Some(p) if found == p + 1 => 10,
+            _ if word_start => 8,
+            Some(p) => 2 - ((found - p - 1).min(10) as i32),
+            None => 2,
+        };
+        previous = Some(found);
+        at = found + 1;
+    }
+    Some(score)
+}
+
 /// Move the cursor to the next key in `direction`, skipping headers, stopping at the ends.
 fn step(items: &[Item], cursor: usize, direction: isize) -> usize {
     let mut at = cursor as isize;
@@ -761,7 +918,7 @@ fn step(items: &[Item], cursor: usize, direction: isize) -> usize {
         if at < 0 || at as usize >= items.len() {
             return cursor;
         }
-        if matches!(items[at as usize], Item::Key(_)) {
+        if !matches!(items[at as usize], Item::Header(_)) {
             return at as usize;
         }
     }
@@ -776,9 +933,15 @@ fn draw(
     cursor: usize,
     focus: &Focus,
     status: Option<&str>,
+    dev: Option<&crate::dev_daemon::Switch>,
 ) {
+    // Ignored keys stay on screen in a line of their own, in yellow: they are not an error to
+    // clear with a keypress, and not something this editor can fix.
+    let ignored = ignored_note(model);
+    let footer_height = if ignored.is_some() { 5 } else { 4 };
     let [list_area, footer_area] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(4)]).areas(frame.area());
+        Layout::vertical([Constraint::Min(3), Constraint::Length(footer_height)])
+            .areas(frame.area());
 
     // The visible window of the list, kept around the cursor.
     let height = list_area.height.saturating_sub(2) as usize;
@@ -794,7 +957,7 @@ fn draw(
             .rev()
             .find_map(|item| match item {
                 Item::Header(section) => Some(*section == "features"),
-                Item::Key(_) => None,
+                Item::Key(_) | Item::DevDaemon => None,
             })
             .unwrap_or(false)
     };
@@ -806,6 +969,32 @@ fn draw(
                     format!("[{section}]"),
                     Style::new().add_modifier(Modifier::BOLD).cyan(),
                 )));
+            }
+            Item::DevDaemon => {
+                let Some(switch) = dev else { continue };
+                // The same two markers and colour as a key: `*` toggled and unsaved, `•` and
+                // yellow this robot is not at the default, which is off.
+                let marker = if switch.pending.is_some() {
+                    "*"
+                } else if switch.on {
+                    "•"
+                } else {
+                    " "
+                };
+                let value = if switch.shown() {
+                    Span::styled("on (default off)", Style::new().yellow())
+                } else {
+                    Span::styled("off", Style::new().dim())
+                };
+                let mut line = Line::from(vec![
+                    Span::raw(format!(" {marker} ")),
+                    Span::raw(format!("{:<30}", crate::dev_daemon::Switch::NAME)),
+                    value,
+                ]);
+                if at == cursor {
+                    line = line.style(Style::new().add_modifier(Modifier::REVERSED));
+                }
+                lines.push(line);
             }
             Item::Key(index) => {
                 let row = &rows[*index];
@@ -862,7 +1051,7 @@ fn draw(
     );
 
     // Footer: what the selected key is, and what the keys do — or the active prompt.
-    let footer: Vec<Line> = match focus {
+    let mut footer: Vec<Line> = match focus {
         Focus::Editing { buffer, error } => vec![
             Line::from(format!("new value: {buffer}▏")),
             Line::from(match error {
@@ -871,27 +1060,62 @@ fn draw(
             }),
         ],
         Focus::Confirm => {
-            let changes = summary(model).join(", ");
+            let mut changes = summary(model);
+            if let Some(on) = dev.and_then(|switch| switch.pending) {
+                changes.push(format!(
+                    "{} = {}",
+                    crate::dev_daemon::Switch::NAME,
+                    if on { "on" } else { "off" }
+                ));
+            }
             vec![
-                Line::from(format!("save {} change(s)? {changes}", model.pending.len())),
+                Line::from(format!(
+                    "save {} change(s)? {}",
+                    changes.len(),
+                    changes.join(", ")
+                )),
                 Line::from("y save · n discard · ESC back"),
             ]
         }
-        // Which daemons, by name: `[media]` is read by `mediad`, and "restart it" over a
-        // change that needs the *other* daemon is how an edit reads as having done nothing.
-        Focus::Restart { units } => {
-            let names = units.join(" and ");
-            let reads = if units.len() == 1 { "reads" } else { "read" };
+        // Which daemons, by name, and what they actually need: `[media]` is read by `mediad`,
+        // and "restart it" over a change that needs the *other* daemon is how an edit reads as
+        // having done nothing. A reload is offered where one exists, because it keeps the motors
+        // powered — it can still ramp a walking robot home, which is why it says so.
+        Focus::Apply { plan } => {
+            let mut what: Vec<String> = Vec::new();
+            if !plan.restart.is_empty() {
+                what.push(format!("restart {}", plan.restart.join(" and ")));
+            }
+            if !plan.reload.is_empty() {
+                what.push(format!("reload {}", plan.reload.join(" and ")));
+            }
+            let reason = if plan.restart.is_empty() {
+                "re-reads [policy] without dropping the motors — a walking robot ramps home first"
+            } else if plan.reload.is_empty() {
+                "reads the config once at startup"
+            } else {
+                "reads some of this at startup and the rest on a call"
+            };
             vec![
-                Line::from(format!(
-                    "written. {names} {reads} the config once at startup —"
-                )),
-                Line::from(format!("restart {names} now? y restart · n later")),
+                Line::from(format!("written. {reason} —")),
+                Line::from(format!("{} now? y do it · n later", what.join(", then "))),
+            ]
+        }
+        Focus::Search { .. } => {
+            let doc = match items.get(cursor) {
+                Some(Item::Key(index)) => rows[*index].entry.doc,
+                Some(Item::DevDaemon) => crate::dev_daemon::Switch::DOC,
+                _ => "",
+            };
+            vec![
+                Line::from(doc),
+                Line::from("type to search · ↑↓ next/prev hit · ENTER/ESC done"),
             ]
         }
         Focus::List => {
             let doc = match items.get(cursor) {
                 Some(Item::Key(index)) => rows[*index].entry.doc,
+                Some(Item::DevDaemon) => crate::dev_daemon::Switch::DOC,
                 _ => "",
             };
             vec![
@@ -899,198 +1123,181 @@ fn draw(
                     Some(s) => Span::styled(s.to_owned(), Style::new().red()),
                     None => Span::raw(doc),
                 }),
-                Line::from("↑↓ move · SPACE toggle · ENTER edit · u default · q quit"),
+                Line::from("↑↓ move · SPACE toggle · ENTER edit · u default · ^f search · q quit"),
             ]
         }
     };
+    if let Some(note) = ignored {
+        footer.insert(0, Line::from(Span::styled(note, Style::new().yellow())));
+    }
     frame.render_widget(
         Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),
         footer_area,
     );
+
+    // The search popup: a small box floated over the list, the list still visible around it so
+    // the selection can be watched moving as the query grows.
+    if let Focus::Search { query, hit, .. } = focus {
+        let hits = if query.is_empty() {
+            0
+        } else {
+            search(items, rows, query).len()
+        };
+        let title = if query.is_empty() {
+            " search ".to_owned()
+        } else if hits == 0 {
+            " search · no match ".to_owned()
+        } else {
+            format!(" search · {}/{hits} ", (*hit).min(hits - 1) + 1)
+        };
+        let width = 60.min(list_area.width.saturating_sub(4)).max(20);
+        let popup = Rect {
+            x: list_area.x + (list_area.width.saturating_sub(width)) / 2,
+            y: list_area.y + 2,
+            width,
+            height: 3,
+        };
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(Line::from(format!("{query}▏"))).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title)
+                    .border_style(if hits == 0 && !query.is_empty() {
+                        Style::new().red()
+                    } else {
+                        Style::new().cyan()
+                    }),
+            ),
+            popup,
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    /// And a robot mid-experiment names every leftover. This is the set a flamingo trial leaves
+    /// behind, which is what the command exists for: `cmd_alpha` at pass-through, a slot pointed
+    /// at somebody's file, another switched off, and a fall gate widened.
+    #[test]
+    fn a_touched_config_names_every_key_that_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("robotd.toml");
+        std::fs::write(
+            &path,
+            "[control]\ncmd_alpha = 1.0\n\
+             [policy]\nwalk = \"/home/pierre/mine.onnx\"\nstand = \"none\"\n\
+             [safety]\nlimp_fall_tilt_z = -0.80\n",
+        )
+        .unwrap();
+
+        let model = super::Model::load(&path).unwrap();
+        let mut changed: Vec<&'static str> = model
+            .rows()
+            .iter()
+            .filter(|row| row.differs())
+            .map(|row| row.entry.key)
+            .collect();
+        changed.sort();
+        assert_eq!(
+            changed,
+            [
+                "control.cmd_alpha",
+                "policy.stand",
+                "policy.walk",
+                "safety.limp_fall_tilt_z"
+            ]
+        );
+    }
+
     use super::*;
 
-    /// The shipped example, which is real config with real comments — the thing edits must
-    /// not destroy.
-    const SHIPPED: &str = include_str!("../../deploy/robotd.toml");
+    /// ctrl+f: letters typed into a name find it, verbatim text finds it anywhere on the row,
+    /// and letters merely scattered through a doc sentence find nothing — `tof` used to land
+    /// on `theremin.enabled` with forty hits behind it.
+    #[test]
+    fn the_search_ranks_the_key_you_meant_first_and_ignores_scattered_letters() {
+        assert!(fuzzy_score("gain", "gain").unwrap() > fuzzy_score("gain", "gait_in_a").unwrap());
+        assert!(fuzzy_score("gan", "gain").is_some());
+        assert_eq!(fuzzy_score("gainz", "gain"), None);
+        assert!(
+            fuzzy_score("LOW", "head_lowpass").is_some(),
+            "case-insensitive"
+        );
+
+        let m = model("");
+        let rows = m.rows();
+        let items = layout_items(&m);
+        let name_of = |at: usize| match items[at] {
+            Item::Key(index) => rows[index].entry.key,
+            Item::Header(_) | Item::DevDaemon => unreachable!("headers are never hits"),
+        };
+        let hits = search(&items, &rows, "nominal_volt");
+        assert_eq!(name_of(hits[0]), "policy.nominal_voltage");
+        let hits = search(&items, &rows, "deadman");
+        assert_eq!(name_of(hits[0]), "safety.deadman_ms");
+        // Typed into the name, not spelled out.
+        let hits = search(&items, &rows, "actsc");
+        assert_eq!(name_of(hits[0]), "policy.action_scale");
+        // Section names are part of the text shown, so they match too.
+        let hits = search(&items, &rows, "safety");
+        assert!(name_of(hits[0]).starts_with("safety."));
+        assert!(search(&items, &rows, "zzzzqqq").is_empty());
+
+        // Every `tof` hit has the three letters together somewhere on the row, or typed into
+        // its name — never spread across the doc.
+        let hits = search(&items, &rows, "tof");
+        assert!(!hits.is_empty());
+        for at in hits {
+            let Item::Key(index) = items[at] else {
+                unreachable!()
+            };
+            let row = &rows[index];
+            let name = row.entry.key.split_once('.').unwrap().1;
+            assert!(
+                searchable(row).to_lowercase().contains("tof")
+                    || fuzzy_score("tof", name).is_some(),
+                "{} matched tof without containing it",
+                row.entry.key
+            );
+        }
+        // The doc of `theremin.enabled` says "ToF theremin" — a fair hit, but a doc hit, so
+        // the rows *about* the sensor come first.
+        let hits = search(&items, &rows, "tof");
+        assert_ne!(name_of(hits[0]), "theremin.enabled");
+        assert!(hits.len() < 15, "{} rows hit tof", hits.len());
+        // Several words all have to hit.
+        assert!(
+            search(&items, &rows, "safety limp")
+                .iter()
+                .all(|&at| name_of(at).contains("limp"))
+        );
+    }
+
+    /// An `(auto)` row opens the editor on the value it resolves to, not on the word `unset`.
+    #[test]
+    fn editing_an_auto_key_starts_from_its_resolved_value() {
+        let m = model("");
+        let rows = m.rows();
+        let bitrate = rows
+            .iter()
+            .find(|r| r.entry.key == "media.bitrate")
+            .unwrap();
+        assert_eq!(bitrate.effective(), "unset");
+        assert_eq!(shown_value(bitrate), bitrate.resolved.as_deref().unwrap());
+        let set = rows
+            .iter()
+            .find(|r| r.entry.key == "safety.deadman_ms")
+            .unwrap();
+        assert_eq!(shown_value(set), set.effective());
+    }
 
     fn model(text: &str) -> Model {
         Model::from_text(Path::new("/test/robotd.toml"), text).expect("parses")
     }
 
-    fn entry(key: &str) -> &'static Entry {
+    fn entry(key: &str) -> &'static robotd_params::registry::Entry {
         robotd_params::registry::entry_for(key).expect("a registry key")
-    }
-
-    /// An empty file is a robot on defaults: every row effective at its default, none
-    /// overridden. The editor's baseline view.
-    #[test]
-    fn an_absent_file_shows_the_defaults() {
-        let m = model("");
-        for row in m.rows() {
-            assert!(!row.overridden(), "{}", row.entry.key);
-            assert!(!row.effective().is_empty(), "{}", row.entry.key);
-        }
-        // Spot-check values against the daemon's documented defaults.
-        let rows = m.rows();
-        let find = |key: &str| rows.iter().find(|r| r.entry.key == key).expect("known");
-        assert_eq!(find("control.hz").effective(), "50");
-        assert_eq!(find("policy.mode").effective(), "walk");
-        assert_eq!(find("safety.limp_fall").effective(), "true");
-        assert_eq!(find("audio.pet_detect").effective(), "unset");
-    }
-
-    /// Editing must not eat the file: comments, ordering and untouched keys all survive a
-    /// set-and-save round trip. This is the property that makes the tool safe to point at a
-    /// robot's real, hand-annotated config.
-    #[test]
-    fn comments_and_unknown_content_survive_an_edit() {
-        let text = "# tuned by hand on 2026-03-01\n\
-                    [control]\n\
-                    hz = 50 # do not touch\n\n\
-                    [audio]\n\
-                    # the speaker crackles above 0.8\n\
-                    enabled = true\n";
-        let mut m = model(text);
-        m.edit(entry("audio.enabled"), "false").expect("edits");
-        let out = m.rendered();
-        assert!(out.contains("# tuned by hand on 2026-03-01"), "{out}");
-        assert!(out.contains("hz = 50 # do not touch"), "{out}");
-        assert!(out.contains("# the speaker crackles above 0.8"), "{out}");
-        assert!(out.contains("enabled = false"), "{out}");
-    }
-
-    /// A key set in a section the file does not have yet creates the section — the shipped
-    /// file keeps everything commented out, so this is the *common* case, not the edge.
-    #[test]
-    fn setting_a_key_creates_its_section_when_needed() {
-        let mut m = model("[control]\nhz = 50\n");
-        m.edit(entry("policy.mode"), "roller").expect("edits");
-        let out = m.rendered();
-        assert!(out.contains("[policy]"), "{out}");
-        assert!(out.contains("mode = \"roller\""), "{out}");
-        // And it parses as the daemon would read it.
-        let parsed: Params = toml::from_str(&out).expect("valid");
-        assert_eq!(parsed.policy.mode.as_str(), "roller");
-    }
-
-    /// Clearing an override removes the key and the comment attached to it — "# why 40" is
-    /// about the 40, and keeping it above nothing would be stranger than taking it along.
-    /// Everything else survives, and typing the default is the same as clearing, so the file
-    /// never accumulates written-out defaults.
-    #[test]
-    fn reverting_removes_the_override_and_its_own_comment_only() {
-        let text =
-            "# the board's story\n[control]\n# why 40: bench board\nhz = 40\ncmd_alpha = 0.3\n";
-        let mut m = model(text);
-        m.edit(entry("control.hz"), "50").expect("the default");
-        let out = m.rendered();
-        assert!(!out.contains("hz = 40"), "{out}");
-        assert!(
-            !out.contains("hz = 50"),
-            "typed default must not be pinned: {out}"
-        );
-        assert!(
-            !out.contains("why 40"),
-            "the override's own comment goes with it: {out}"
-        );
-        assert!(out.contains("cmd_alpha = 0.3"), "{out}");
-        assert!(out.contains("# the board's story"), "{out}");
-    }
-
-    /// The toggles: bool flips, tri-state cycles through auto, choices wrap around.
-    #[test]
-    fn toggling_produces_the_next_sensible_value() {
-        let mut m = model("");
-        let toggle = |m: &Model, key: &str| {
-            let rows = m.rows();
-            let row = rows.iter().find(|r| r.entry.key == key).expect("known");
-            m.toggled(row)
-        };
-        assert_eq!(toggle(&m, "audio.enabled").as_deref(), Some("false"));
-        assert_eq!(toggle(&m, "policy.mode").as_deref(), Some("roller"));
-        // Tri-state: unset → on → off → unset.
-        assert_eq!(toggle(&m, "audio.pet_detect").as_deref(), Some("true"));
-        m.edit(entry("audio.pet_detect"), "true").expect("edits");
-        assert_eq!(toggle(&m, "audio.pet_detect").as_deref(), Some("false"));
-        m.edit(entry("audio.pet_detect"), "false").expect("edits");
-        assert_eq!(toggle(&m, "audio.pet_detect").as_deref(), Some("unset"));
-        // Numbers are typed, not toggled.
-        assert_eq!(toggle(&m, "control.hz"), None);
-    }
-
-    /// Bad input is refused at the row, with the reason — not written and bounced by the
-    /// validator later, when the user has moved on.
-    #[test]
-    fn bad_input_is_refused_where_it_is_typed() {
-        let mut m = model("");
-        assert!(m.edit(entry("control.hz"), "fast").is_err());
-        assert!(m.edit(entry("policy.mode"), "hovercraft").is_err());
-        assert!(m.edit(entry("audio.enabled"), "maybe").is_err());
-        assert!(m.edit(entry("control.cmd_alpha"), "0.3.0").is_err());
-        assert!(m.pending.is_empty(), "nothing queued: {:?}", m.pending);
-    }
-
-    /// The saved file must pass the daemon's own gate — a value the row-level checks cannot
-    /// judge (hz range) is caught before the write, and the file on disk stays untouched.
-    #[test]
-    fn a_config_robotd_would_reject_is_never_written() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("robotd.toml");
-        std::fs::write(&path, "[control]\nhz = 50\n").expect("writes");
-        let mut m = Model::load(&path).expect("loads");
-        // 0 parses as an integer; only Params::load knows it divides by zero.
-        m.edit(entry("control.hz"), "0").expect("row-level ok");
-        let err = m.save().expect_err("must refuse");
-        assert!(err.contains("robotd would reject"), "{err}");
-        let on_disk = std::fs::read_to_string(&path).expect("reads");
-        assert_eq!(on_disk, "[control]\nhz = 50\n", "disk untouched");
-        // The staging file is cleaned up, not left beside the config.
-        assert!(!path.with_extension("toml.new").exists());
-    }
-
-    /// A good save is atomic-by-rename, folds the edits in, and a fresh load agrees.
-    #[test]
-    fn a_save_round_trips_through_the_real_loader() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("robotd.toml");
-        std::fs::write(&path, SHIPPED).expect("writes");
-        let mut m = Model::load(&path).expect("loads");
-        m.edit(entry("policy.mode"), "roller").expect("edits");
-        m.edit(entry("audio.enabled"), "false").expect("edits");
-        m.save().expect("saves");
-        assert!(m.pending.is_empty());
-
-        let reloaded = Params::load(&path, true).expect("the daemon can start on it");
-        assert_eq!(reloaded.policy.mode.as_str(), "roller");
-        assert!(!reloaded.audio.enabled);
-        // The shipped file's documentation survived the trip.
-        let text = std::fs::read_to_string(&path).expect("reads");
-        assert!(
-            text.contains("Read once at startup") || text.lines().count() > 50,
-            "the comments are gone: {} lines",
-            text.lines().count()
-        );
-    }
-
-    /// The shipped example loads into the editor, and every value it does set explicitly is
-    /// the default — the editor-side echo of robotd's own example-matches-defaults test, and
-    /// the reason a fresh robot's config shows no surprising overrides.
-    #[test]
-    fn the_shipped_example_sets_nothing_away_from_default() {
-        let m = model(SHIPPED);
-        for row in m.rows() {
-            if let Some(set) = &row.set {
-                assert_eq!(
-                    set, &row.default,
-                    "{} is shipped away from its default",
-                    row.entry.key
-                );
-            }
-        }
     }
 
     /// The restart offer names the daemon that reads what changed. `[media]` is read by
@@ -1100,128 +1307,236 @@ mod tests {
     fn the_restart_offer_names_the_daemon_that_reads_the_change() {
         let mut m = model("");
         m.edit(entry("media.quality"), "360p30").expect("valid");
-        assert_eq!(units_for(&m), vec!["mediad"]);
+        assert_eq!(plan_for(&m).restart, vec!["mediad"]);
 
         let mut m = model("");
         m.edit(entry("control.hz"), "60").expect("valid");
-        assert_eq!(units_for(&m), vec!["robotd"]);
+        assert_eq!(plan_for(&m).restart, vec!["robotd"]);
 
         // Both, and robotd first: mediad.service is After=robotd.service, so the other order
         // reconnects mediad to a robotd that is about to go away.
         let mut m = model("");
-        m.edit(entry("media.camera"), "false").expect("valid");
+        m.edit(entry("media.source"), "test").expect("valid");
         m.edit(entry("audio.enabled"), "false").expect("valid");
-        assert_eq!(units_for(&m), vec!["robotd", "mediad"]);
+        assert_eq!(plan_for(&m).restart, vec!["robotd", "mediad"]);
 
-        // Nothing pending is nothing to restart, and the caller must not offer one.
-        assert!(units_for(&model("")).is_empty());
+        // Nothing pending is nothing to ask about, and the caller must not offer anything.
+        assert!(plan_for(&model("")).is_quiet());
+        assert!(plan_for(&model("")).live.is_empty());
     }
 
-    /// An unset bitrate shows what it will actually stream at, and follows the quality as it
-    /// is cycled — the reason it is optional rather than a number to keep in step by hand.
+    /// `[head_imu]` is `tofd`'s, and it read as `robotd`'s on the board.
+    ///
+    /// Turning the head IMU on through this editor restarted `robotd` — which never looks at the
+    /// key — and left `tofd` running on the value it loaded at boot. The switch was on in the
+    /// file, off in the daemon, and the only sign was a startup line nobody re-reads. Regression
+    /// test rather than an assertion folded into the case above, because the two IMU sections are
+    /// a name apart (and now less so): `pad_imu_head_control` is the controller's, and `padd` re-reads it by itself.
     #[test]
-    fn an_unset_bitrate_shows_what_the_quality_resolves_to() {
+    fn the_head_imu_switch_restarts_tofd_and_not_robotd() {
         let mut m = model("");
-        let bitrate = |m: &Model| {
-            m.rows()
-                .into_iter()
-                .find(|row| row.entry.key == "media.bitrate")
-                .expect("known")
-        };
-        let row = bitrate(&m);
-        assert_eq!(row.set, None);
-        assert_eq!(row.resolved.as_deref(), Some("2000000"));
+        m.edit(entry("head_imu.enabled"), "true").expect("valid");
+        let plan = plan_for(&m);
+        assert_eq!(plan.restart, vec!["tofd"]);
+        assert!(plan.live.is_empty());
 
-        m.edit(entry("media.quality"), "1080p30").expect("valid");
-        assert_eq!(bitrate(&m).resolved.as_deref(), Some("4000000"));
-
-        // Set explicitly, it is a value like any other and no longer a hint.
-        m.edit(entry("media.bitrate"), "3000000").expect("valid");
-        let row = bitrate(&m);
-        assert_eq!(row.set.as_deref(), Some("3000000"));
-        assert_eq!(row.resolved, None);
-
-        // And `unset` puts it back to following the quality rather than pinning the default.
-        m.edit(entry("media.bitrate"), "unset").expect("valid");
-        assert_eq!(bitrate(&m).resolved.as_deref(), Some("4000000"));
+        let mut m = model("");
+        m.edit(entry("pad_imu_head_control.enabled"), "true")
+            .expect("valid");
+        let plan = plan_for(&m);
+        assert_eq!(
+            plan.live,
+            vec!["padd"],
+            "the controller's IMU is padd's, and padd re-reads it"
+        );
+        assert!(plan.restart.is_empty(), "and it needs no restart");
     }
 
-    /// The editor's own gate is `Params::load`, so a bitrate in the wrong unit never reaches
-    /// the disk — the mistake is caught while the file is still the one that works.
+    /// Controller sections are live: padd re-reads them, so there is nothing to offer.
+    ///
+    /// The inverse of the `[head_imu]` bug and the same mistake — a mapping that does not
+    /// describe the daemon. `padd` stats the file every second and re-reads its settings when
+    /// the mtime moves, which is why `robotctl pad bind` prints "padd picks this up within a
+    /// second" rather than offering anything. Restarting it to apply what applies by itself
+    /// takes the pad session down, and robotd's deadman then zeroes the velocity of whatever was
+    /// walking — a real cost, paid for nothing.
     #[test]
-    fn a_bitrate_in_kilobits_is_not_written() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("robotd.toml");
-        let mut m = Model::load(&path).expect("empty is a model");
-        m.edit(entry("media.bitrate"), "2000")
-            .expect("parses as a number");
-        assert!(m.save().is_err(), "mediad would stream nothing at 2 kb/s");
-        assert!(!path.exists(), "and nothing was written");
+    fn the_pad_sections_need_no_restart_at_all() {
+        for key in [
+            "pad.a",
+            "pad.y",
+            "pad_imu_head_control.enabled",
+            "pad_imu_head_control.gain",
+            "pad_drive.vx_max",
+            "pad_drive.vyaw_min",
+            "pad_axes.drive.vyaw.gain",
+            "pad_head.head_yaw_max",
+            "pad_body.roll_max",
+            "pad_roller.vyaw_max",
+        ] {
+            let mut m = model("");
+            let value = match key {
+                "pad_imu_head_control.enabled" => "true",
+                "pad_imu_head_control.gain"
+                | "pad_drive.vx_max"
+                | "pad_axes.drive.vyaw.gain"
+                | "pad_head.head_yaw_max"
+                | "pad_body.roll_max"
+                | "pad_roller.vyaw_max" => "0.5",
+                "pad_drive.vyaw_min" => "-1.2",
+                _ => "walk",
+            };
+            m.edit(entry(key), value).expect("valid");
+            let plan = plan_for(&m);
+            assert!(plan.is_quiet(), "{key} must not ask for anything: {plan:?}");
+            assert_eq!(plan.live, vec!["padd"], "{key}");
+        }
+
+        // Paired with a restart it stays quiet about padd and loud about the other one: the
+        // offer is for the daemon that needs it, and padd is neither restarted nor mentioned in
+        // it.
+        let mut m = model("");
+        m.edit(entry("pad.a"), "walk").expect("valid");
+        m.edit(entry("safety.deadman_ms"), "800").expect("valid");
+        let plan = plan_for(&m);
+        assert_eq!(plan.restart, vec!["robotd"]);
+        assert_eq!(plan.live, vec!["padd"]);
     }
 
-    /// An inline comment is decor, not data: `hz = 50 # do not touch` is the value 50. This
-    /// once rode into the value cell and made an at-default key look overridden and annotated.
+    /// `[policy]` reloads instead of restarting — except the two keys a reload does not carry.
+    ///
+    /// `PolicyChange::Reload` re-reads that section whole and rebuilds the controller from it,
+    /// which is how `robotctl policy add` lands a skill on a running robot. Restarting robotd
+    /// for `action_scale` takes motor control away from a standing robot to change a number it
+    /// would have taken standing up. `mode` is deliberately kept across a reload and `enabled`
+    /// is read once at startup — with the reload call *refused* while it is false, so off to on
+    /// cannot be one.
     #[test]
-    fn an_inline_comment_is_not_part_of_the_value() {
-        let m = model("[control]\nhz = 50 # do not touch, bench board\n");
-        let rows = m.rows();
-        let hz = rows
+    fn the_policy_section_reloads_but_its_two_startup_keys_do_not() {
+        let mut m = model("");
+        m.edit(entry("policy.action_scale"), "0.4").expect("valid");
+        let plan = plan_for(&m);
+        assert_eq!(plan.reload, vec!["robotd"]);
+        assert!(plan.restart.is_empty(), "the motors stay powered");
+
+        let mut m = model("");
+        m.edit(entry("policy.enabled"), "true").expect("valid");
+        assert_eq!(
+            plan_for(&m).restart,
+            vec!["robotd"],
+            "a reload is refused while policies are off"
+        );
+
+        let mut m = model("");
+        m.edit(entry("policy.mode"), "roller").expect("valid");
+        assert_eq!(
+            plan_for(&m).restart,
+            vec!["robotd"],
+            "a reload keeps the running mode, so the file's would be ignored"
+        );
+
+        // One section, both answers, and the restart absorbs the reload. "restart robotd, then
+        // reload robotd" would ramp a walking robot home a second time to apply what coming back
+        // up already applied.
+        let mut m = model("");
+        m.edit(entry("policy.mode"), "roller").expect("valid");
+        m.edit(entry("policy.gain"), "300").expect("valid");
+        let plan = plan_for(&m);
+        assert_eq!(plan.restart, vec!["robotd"]);
+        assert!(plan.reload.is_empty(), "the restart is the reload");
+    }
+
+    /// Every key in the registry says how it applies.
+    ///
+    /// What went wrong with `[head_imu]` was not a wrong answer, it was a default one: a
+    /// catch-all arm answered `robotd` for a section nobody had mapped, so adding a section was
+    /// enough to ship a restart offer that restarts the wrong daemon. There is no catch-all now,
+    /// and this fails for the next key added without an arm — at `cargo test`, not on a board,
+    /// and not as a switch that silently does nothing.
+    #[test]
+    fn every_registry_key_says_how_it_applies() {
+        let unmapped: Vec<&str> = robotd_params::registry::REGISTRY
             .iter()
-            .find(|r| r.entry.key == "control.hz")
-            .expect("known");
-        assert_eq!(hz.set.as_deref(), Some("50"));
-        assert!(!hz.differs(), "50 is the default, however it is annotated");
-        assert!(hz.overridden(), "it is still written in the file");
-    }
-
-    /// The colour question: set-but-equal is not a divergence. Only a value actually away
-    /// from the default differs.
-    #[test]
-    fn writing_the_default_out_is_not_a_divergence() {
-        let m = model("[policy]\nenabled = true\nmode = \"roller\"\n");
-        let rows = m.rows();
-        let find = |key: &str| rows.iter().find(|r| r.entry.key == key).expect("known");
-        assert!(!find("policy.enabled").differs(), "true is the default");
-        assert!(find("policy.enabled").overridden());
-        assert!(find("policy.mode").differs(), "roller is not");
-    }
-
-    /// `unset` was a word that told nobody anything; the daemon can usually say what unset
-    /// *resolves to*, per mode — and the hint follows the mode when it changes.
-    #[test]
-    fn unset_keys_show_what_they_resolve_to() {
-        let mut m = model("");
-        let hint = |m: &Model, key: &str| {
-            m.rows()
-                .iter()
-                .find(|r| r.entry.key == key)
-                .expect("known")
-                .resolved
-                .clone()
-        };
-        let walk = hint(&m, "policy.walk").expect("resolves");
-        assert!(walk.contains("alpha_walking"), "{walk}");
-        assert_eq!(hint(&m, "policy.legs_lowpass").as_deref(), Some("0.7"));
-        assert_eq!(
-            hint(&m, "audio.pet_detect").as_deref(),
-            Some("false"),
-            "petting is an opt-in now, in every mode"
-        );
-        // Flip the mode and the hints follow — they are resolved through the pending state.
-        m.edit(entry("policy.mode"), "roller").expect("edits");
-        assert_eq!(
-            hint(&m, "audio.pet_detect").as_deref(),
-            Some("false"),
-            "the roller does not"
-        );
-        let crouch = hint(&m, "policy.ground_pick").expect("resolves");
+            .map(|e| e.key)
+            .filter(|key| apply_for(key).is_none())
+            .collect();
         assert!(
-            crouch.contains("crouch") || crouch.contains("roller"),
-            "{crouch}"
+            unmapped.is_empty(),
+            "nothing says how {unmapped:?} applies — add an arm to `apply_for`"
         );
-        // A set key hints nothing — the value speaks for itself.
-        m.edit(entry("policy.legs_lowpass"), "0.6").expect("edits");
-        assert_eq!(hint(&m, "policy.legs_lowpass"), None);
+    }
+
+    /// `allow_community` sits in `[policy]` but belongs to `updaterd`, which reads it before every
+    /// fetch. Falling through to the section's arm would offer to reload a walking robot for a key
+    /// it never reads.
+    #[test]
+    fn allow_community_is_live_in_the_updater_and_disturbs_nothing() {
+        let plan = plan_for_written(&["policy.allow_community".to_string()]);
+        assert_eq!(plan.live, vec!["updaterd"]);
+        assert!(plan.is_quiet(), "{plan:?}");
+    }
+
+    /// `boot_deadline_s` sits in `[update_gate]` but is the boot check's, read once per boot.
+    /// Falling through to the section's arm would offer to restart robotd — standing motors and
+    /// all — for a key it never reads, and the change would still wait for the reboot.
+    #[test]
+    fn the_boot_deadline_waits_for_a_boot_and_restarts_nothing() {
+        let plan = plan_for_written(&["update_gate.boot_deadline_s".to_string()]);
+        assert_eq!(plan.next_boot, vec!["robot-boot-check"]);
+        assert!(plan.restart.is_empty(), "{plan:?}");
+        assert!(plan.is_quiet(), "{plan:?}");
+    }
+
+    /// Either half of the pad source restarted alone leaves the other on the old answer.
+    #[test]
+    fn a_netpad_change_restarts_both_pad_daemons() {
+        let plan = plan_for_written(&["netpad.enabled".to_string(), "netpad.port".to_string()]);
+        assert_eq!(plan.restart, vec!["netpadd", "padd"]);
+    }
+
+    /// The offer says which daemon and which of the three answers, in words.
+    ///
+    /// The screen is the whole user interface to this mapping: an operator who reads "restart
+    /// robotd" over a `[media]` change learns the wrong thing about their robot, and one who is
+    /// asked to restart `padd` for a binding pays for nothing. Rendered rather than asserted on
+    /// the `Plan`, because what went wrong on the board was what the screen *said*.
+    #[test]
+    fn the_offer_says_which_daemon_and_what_it_needs() {
+        let screen_for = |focus: &Focus| {
+            let m = model("");
+            let rows = m.rows();
+            let items = layout_items(&m);
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24))
+                .expect("terminal");
+            terminal
+                .draw(|frame| draw(frame, &m, &rows, &items, 1, focus, None, None))
+                .expect("draws");
+            format!("{:?}", terminal.backend().buffer())
+        };
+
+        let restart = screen_for(&Focus::Apply {
+            plan: plan_for_keys(["head_imu.enabled"].into_iter()),
+        });
+        assert!(restart.contains("restart tofd"), "{restart}");
+        assert!(restart.contains("once at startup"), "{restart}");
+
+        // A reload names itself as one, and says the thing an operator standing over the robot
+        // wants to know: the motors stay powered, and a walking robot ramps home first.
+        let reload = screen_for(&Focus::Apply {
+            plan: plan_for_keys(["policy.gain"].into_iter()),
+        });
+        assert!(reload.contains("reload robotd"), "{reload}");
+        assert!(!reload.contains("restart"), "{reload}");
+        assert!(reload.contains("ramps home"), "{reload}");
+
+        // Both, in the order they are done.
+        let both = screen_for(&Focus::Apply {
+            plan: plan_for_keys(["media.quality", "policy.gain"].into_iter()),
+        });
+        assert!(
+            both.contains("restart mediad, then reload robotd"),
+            "{both}"
+        );
     }
 
     /// The whole first screen renders without panicking, features first — the same
@@ -1239,7 +1554,7 @@ mod tests {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 30)).expect("terminal");
         terminal
-            .draw(|frame| draw(frame, &m, &rows, &items, cursor, &Focus::List, None))
+            .draw(|frame| draw(frame, &m, &rows, &items, cursor, &Focus::List, None, None))
             .expect("draws");
         let screen = format!("{:?}", terminal.backend().buffer());
         assert!(screen.contains("[features]"), "features head the list");
@@ -1249,6 +1564,63 @@ mod tests {
         assert!(screen.contains("audio.enabled"), "{screen}");
         // The divergence annotation: mode is set away from default.
         assert!(screen.contains("roller (default walk)"), "{screen}");
+    }
+
+    /// The dev-board switch heads the list where there is an `updaterd` to configure, the cursor
+    /// starts on it, toggling it shows as an unsaved change, and search finds it.
+    #[test]
+    fn the_dev_board_switch_is_the_first_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("updater.toml");
+        std::fs::write(
+            &config,
+            format!("state_dir = \"{}\"\n", dir.path().display()),
+        )
+        .unwrap();
+        let mut switch = crate::dev_daemon::Switch::load(&config).expect("a switch");
+
+        let m = model("");
+        let rows = m.rows();
+        let items = with_dev_row(layout_items(&m), Some(&switch));
+        assert!(matches!(items[0], Item::Header(DEV_HEADER)));
+        assert!(matches!(items[1], Item::DevDaemon));
+        assert_eq!(step(&items, 1, -1), 1, "the header above it is not a stop");
+        assert!(matches!(
+            items[search(&items, &rows, "dev daemon")[0]],
+            Item::DevDaemon
+        ));
+
+        let screen = |switch: &crate::dev_daemon::Switch, focus: &Focus| {
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 30))
+                .expect("terminal");
+            terminal
+                .draw(|frame| draw(frame, &m, &rows, &items, 1, focus, None, Some(switch)))
+                .expect("draws");
+            format!("{:?}", terminal.backend().buffer())
+        };
+        let off = screen(&switch, &Focus::List);
+        assert!(off.contains("[dev board]"), "{off}");
+        assert!(off.contains("allow_dev_daemon"), "{off}");
+        assert!(
+            off.contains("restarts updaterd"),
+            "the doc is in the footer: {off}"
+        );
+
+        switch.toggle();
+        let on = screen(&switch, &Focus::List);
+        assert!(on.contains(" * allow_dev_daemon"), "{on}");
+        assert!(on.contains("on (default off)"), "{on}");
+        let confirm = screen(&switch, &Focus::Confirm);
+        assert!(
+            confirm.contains("save 1 change(s)? allow_dev_daemon = on"),
+            "{confirm}"
+        );
+
+        // No `updaterd` here: no row, and nothing else moves.
+        assert_eq!(
+            with_dev_row(layout_items(&m), None).len(),
+            layout_items(&m).len()
+        );
     }
 
     /// A section whose only key is a feature switch draws no header.
@@ -1264,7 +1636,7 @@ mod tests {
             .iter()
             .filter_map(|item| match item {
                 Item::Header(h) => Some(*h),
-                Item::Key(_) => None,
+                Item::Key(_) | Item::DevDaemon => None,
             })
             .collect();
         assert!(
@@ -1285,18 +1657,22 @@ mod tests {
         assert!(
             items.iter().any(|item| match item {
                 Item::Key(index) => rows[*index].entry.key == "chorale.accept",
-                Item::Header(_) => false,
+                Item::Header(_) | Item::DevDaemon => false,
             }),
             "chorale.accept must still be editable"
         );
     }
 
+    /// A `[duck_detector]` change restarts `mediad`, not `robotd`.
+    ///
+    /// `robotd` owned every key in this file for long enough that the restart was hardcoded, and
+    /// `[duck_detector]` is read by `mediad` because the camera frames are on its tee. Restarting the
     /// A save records what it wrote, because that is what decides the restart.
     ///
     /// The bug this pins: `save` clears `pending`, and the restart decision is made after the
-    /// editor closes — so reading `pending` there found an empty map, `units_to_restart` returned
-    /// nothing, and turning the detector off looked like it had no effect at all. Twice, on a
-    /// robot, before anybody suspected the editor rather than the daemon.
+    /// editor closes — so reading `pending` there found an empty map, the plan came back empty,
+    /// and turning the detector off looked like it had no effect at all. Twice, on a robot,
+    /// before anybody suspected the editor rather than the daemon.
     #[test]
     fn a_save_remembers_what_it_wrote_so_the_right_daemon_restarts() {
         let dir = tempfile::tempdir().unwrap();
@@ -1305,60 +1681,47 @@ mod tests {
         let mut m = Model::load(&path).expect("loads");
 
         assert!(m.written().is_empty(), "nothing written yet");
-        m.edit(entry("detect.enabled"), "true").expect("edits");
+        m.edit(entry("duck_detector.enabled"), "true")
+            .expect("edits");
         assert!(!m.pending.is_empty());
         m.save().expect("saves");
 
         assert!(m.pending.is_empty(), "a save clears what is pending");
-        assert_eq!(m.written(), ["detect.enabled".to_owned()]);
-        assert_eq!(units_to_restart(m.written()), vec!["mediad"]);
+        assert_eq!(m.written(), ["duck_detector.enabled".to_owned()]);
+        assert_eq!(plan_for_written(m.written()).restart, vec!["mediad"]);
 
         // A second save adds to the record rather than replacing it: somebody who changes the
         // detector and then the gait wants both daemons restarted.
         m.edit(entry("policy.mode"), "roller").expect("edits");
         m.save().expect("saves");
-        assert_eq!(units_to_restart(m.written()), vec!["robotd", "mediad"]);
+        assert_eq!(
+            plan_for_written(m.written()).restart,
+            vec!["robotd", "mediad"]
+        );
     }
 
-    /// A `[detect]` change restarts `mediad`, not `robotd`.
-    ///
-    /// `robotd` owned every key in this file for long enough that the restart was hardcoded, and
-    /// `[detect]` is read by `mediad` because the camera frames are on its tee. Restarting the
     /// wrong daemon is how somebody edits a value three times and swears it does nothing.
     #[test]
     fn the_section_decides_which_daemon_restarts() {
-        let detect = vec!["detect.enabled".to_owned()];
-        assert_eq!(units_to_restart(&detect), vec!["mediad"]);
+        let detect = vec!["duck_detector.enabled".to_owned()];
+        assert_eq!(plan_for_written(&detect).restart, vec!["mediad"]);
 
         let policy = vec!["policy.mode".to_owned()];
-        assert_eq!(units_to_restart(&policy), vec!["robotd"]);
+        assert_eq!(plan_for_written(&policy).restart, vec!["robotd"]);
 
         // Both, in the order they are least disruptive to restart: the control loop first, then the
         // camera — a robot that is standing up should not be waiting on a WebRTC teardown.
-        let both = vec!["detect.hz".to_owned(), "audio.enabled".to_owned()];
-        assert_eq!(units_to_restart(&both), vec!["robotd", "mediad"]);
+        let both = vec!["duck_detector.hz".to_owned(), "audio.enabled".to_owned()];
+        assert_eq!(plan_for_written(&both).restart, vec!["robotd", "mediad"]);
 
-        assert!(units_to_restart(&[]).is_empty());
-    }
+        // A button change restarts nothing: `padd` reads it back off the file by itself, and
+        // offering `robotd` here would drop motor control — a standing robot on the floor — to
+        // apply a setting it never sees.
+        let pad = vec!["pad.x".to_owned()];
+        let plan = plan_for_written(&pad);
+        assert!(plan.is_quiet());
+        assert_eq!(plan.live, vec!["padd"]);
 
-    /// Sections come out in registry order, once each — the editor's headers.
-    #[test]
-    fn sections_are_ordered_and_unique() {
-        let s = sections();
-        assert_eq!(
-            s,
-            vec![
-                "bus",
-                "control",
-                "update_gate",
-                "policy",
-                "safety",
-                "detect",
-                "chorale",
-                "theremin",
-                "audio",
-                "media"
-            ]
-        );
+        assert_eq!(plan_for_written(&[]), Plan::default());
     }
 }

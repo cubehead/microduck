@@ -30,14 +30,14 @@
 //! the advertisement in step. [`adv`] is the layout of the address field, shared with the client
 //! that decodes it.
 
-pub mod adv;
+#[cfg(target_os = "linux")]
+pub mod agent;
 #[cfg(target_os = "linux")]
 pub mod bluez;
 pub mod chorale;
-pub mod framing;
-pub mod gatt;
 pub mod link;
 pub mod pairing;
 pub mod route;
+pub mod secure;
 pub mod session;
 pub mod upstream;

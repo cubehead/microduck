@@ -1,16 +1,13 @@
 //! `mediad` — camera, mic, WebRTC, and the remote gateway.
 //!
-//! Runs the signalling server in this process, streams video to whoever connects, and gives each
-//! peer a `control` datachannel that is a pipe to the robot API. `docs/design/remote-webrtc.md` is
-//! the design.
+//! Runs the signalling server in this process and gives each admitted peer a `control`
+//! datachannel that is a pipe to the robot API. `docs/design/remote-webrtc.md` is the design.
 //!
 //! ## What it does not do
 //!
-//! **It does not authenticate.** Anyone who reaches the signalling port can drive the robot and
-//! see its camera. That is a decision, not an omission — §4 has the reasoning, and the short
-//! version is that the pairing PIN is a shared `000000`, so a gate would add a step to every
-//! connection and prove nothing. The bridge that makes a robot reachable from outside the LAN
-//! authenticates on both sides before a session arrives.
+//! **The local signalling server does not authenticate.** It therefore binds to loopback by
+//! default; the remote bridge authenticates before forwarding a session to it. Explicitly
+//! binding a LAN address exposes camera and control to every peer that can reach that address.
 //!
 //! **It is not on the recovery path.** If `mediad` will not start, the robot still walks, still
 //! takes an update, and is still reachable over Bluetooth. That is why it may depend on a plugin
@@ -26,16 +23,48 @@ use clap::Parser;
 struct Args {
     /// Where to bind the signalling server.
     ///
-    /// All interfaces by default, and that is the point: loopback-only would mean a peer on the
-    /// LAN cannot reach it at all and every session would have to go through a bridge, which
-    /// defeats having a local mode. See `remote-webrtc.md` §3.
-    #[arg(long, default_value = "0.0.0.0")]
+    /// Also used for the unauthenticated console and snapshot endpoint. Keep loopback-only
+    /// until an authenticated local gateway is available. A LAN bind is for controlled benches.
+    #[arg(long, default_value = "127.0.0.1")]
     host: String,
 
     /// The signalling server's port. 8443 is what `webrtcsink`'s own signaller defaults to, so a
     /// client built against it needs no argument.
     #[arg(long, default_value_t = 8443)]
     port: u32,
+
+    /// The rendezvous service this robot registers with, so it can be reached from off its LAN.
+    ///
+    /// Defaults to the Space the mini's fleet uses. A flag rather than a config key because there
+    /// is nothing to choose on a real robot — what it is for is pointing a board at a fake, or at
+    /// a self-hosted copy on the day somebody wants one. `docs/design/remote-access-design.md` §4.
+    #[arg(long, default_value = mediad::relay::DEFAULT_RENDEZVOUS)]
+    rendezvous_url: String,
+
+    /// The account credential `updaterd` writes, which the relay needs to prove whose robot this
+    /// is. Absent means nobody has signed this robot in, and remote access is simply off.
+    #[arg(long, default_value = mediad::relay::DEFAULT_TOKEN_PATH)]
+    token: PathBuf,
+
+    /// Where short-lived TURN credentials come from.
+    ///
+    /// Hugging Face hosts this proxy and mints Cloudflare credentials for the account the token
+    /// belongs to, which is why offering a relay needs no new secret on the robot. A flag for
+    /// pointing a board at a fake; there is nothing to choose on a real one.
+    ///
+    /// Checked here rather than trusted: this is the one URL the account token is sent to, and
+    /// `parse_endpoint` says what it will not send it over.
+    #[arg(long, default_value = mediad::turn::DEFAULT_TURN_ENDPOINT,
+          value_parser = mediad::turn::parse_endpoint)]
+    turn_url: String,
+
+    /// Do not register with the rendezvous service, whatever the token file says.
+    ///
+    /// For a board that is signed in and being worked on: a duck registering from a bench while
+    /// somebody drives the same account's robot elsewhere is a producer in a list nobody wants,
+    /// and evicting it means finding this flag afterwards.
+    #[arg(long)]
+    no_remote: bool,
 
     /// Where the console is served. `http://<robot>:8080/`, and nothing else to run.
     ///
@@ -61,26 +90,31 @@ struct Args {
     #[arg(long, default_value = "/dev/video0")]
     camera_device: String,
 
-    /// Sensor exposure in lines (~19 µs each) and analogue gain, where 256 is 1x.
+    /// Sensor exposure in lines and analogue gain, in the sensor's own units — 256 is 1x on the
+    /// IMX219, 64 on the GC2093.
     ///
     /// The starting values only: with the driver's boot values the picture is black rather than
     /// merely dark, so something must write the sensor before the first frame. On a board where
     /// `scripts/setup-rkaiq.sh` installed the 3A engine, it converges exposure from here; on one
-    /// where it did not, these are what the camera keeps. The defaults are the prototype's.
-    #[arg(long, default_value_t = 600)]
-    exposure: u32,
+    /// where it did not, these are what the camera keeps. Unset is the sensor's own starting point
+    /// (`mediad::sensor`): the same picture on every sensor, which one number in one unit is not.
+    #[arg(long)]
+    exposure: Option<u32>,
 
-    #[arg(long, default_value_t = 1024)]
-    analogue_gain: u32,
+    #[arg(long)]
+    analogue_gain: Option<u32>,
 
     /// How far the camera is mounted from upright, clockwise: 0, 90, 180 or 270.
     ///
-    /// **90, because the head camera is mounted a quarter turn off**, and this is the one place that
-    /// fact is written down. It no longer means "rotate the pixels": it is told to whoever displays
-    /// the video, and they rotate for free — the console with a CSS transform on the GPU. Rotating
-    /// here cost 145% of a core and 22 fps; `pipeline::Rotation` has the numbers.
-    #[arg(long, default_value_t = 90)]
-    rotate: u32,
+    /// **The board's mount by default** (`Board::camera_mount_degrees`): 90 on the Zero 3W, whose
+    /// head camera is mounted a quarter turn off, and 0 on the beta, whose camera is upright. It no longer means "rotate the pixels": it is told to
+    /// whoever displays the video, and they rotate for free — the console with a CSS transform on
+    /// the GPU. Rotating here cost 145% of a core and 22 fps; `pipeline::Rotation` has the numbers.
+    ///
+    /// True of a simulated camera too: the one in MuJoCo is rolled to match the mount, so a frame
+    /// from a duck in the twin needs the same quarter turn as a frame from a duck on the desk.
+    #[arg(long)]
+    rotate: Option<u32>,
 
     /// Leave the exposure where `--exposure` and `--analogue-gain` put it, instead of metering.
     ///
@@ -88,10 +122,22 @@ struct Args {
     /// `rkaiq_3A_server` owns white balance, gamma and noise reduction, and its AE converges the
     /// sensor at stream start and then stops responding — and skips even that on a boot where it
     /// missed the stream-start event, which is the "3A stopped working" shape. `mediad::exposure`
-    /// is the loop. Turn it off for a fixed exposure: a calibration capture, or a board whose
-    /// engine really does keep converging.
+    /// is the loop. Turn it off for a fixed exposure, such as a calibration capture. A sensor whose
+    /// engine really does keep converging — the beta's GC2093 — never starts it
+    /// (`mediad::sensor::Metering`).
     #[arg(long)]
     no_auto_exposure: bool,
+
+    /// Take frames from a duck in MuJoCo at `host:port` instead of a camera.
+    ///
+    /// The geometry has to match the simulator's camera — set `[media] quality` (the rung `mediad`
+    /// streams; `mediad` has no `--width`/`--height` of its own) to the resolution and rate the body
+    /// renders at — because the frames arrive raw and length-prefixed with no handshake, and a
+    /// mismatch is a picture nobody can read rather than an error the pipeline can recover from.
+    /// `mediad` says so and refuses the frame if the sizes disagree.
+    /// Takes precedence over `[media] source`, which is a fact about a robot and not about this.
+    #[arg(long)]
+    sim_camera: Option<String>,
 
     /// Rotate in the pipeline as well, so the *encoded stream* comes out upright.
     ///
@@ -101,9 +147,54 @@ struct Args {
     /// Worth it only for a consumer that cannot rotate for itself.
     #[arg(long)]
     flip_in_pipeline: bool,
+
+    /// Where the daemons listen, when not at `proto::socket`'s paths.
+    ///
+    /// On a robot the defaults are right and none of these is ever typed. They exist for the twin
+    /// (`scripts/duck-sim`), where every duck's `robotd` and `tofd` listen under a per-duck state
+    /// directory — without them a peer's `control` channel reaches a `mediad` whose routes all end
+    /// at `/run/*.sock`, and every call but `media.video` answers "not answering".
+    #[arg(long)]
+    robot_socket: Option<std::path::PathBuf>,
+    #[arg(long)]
+    tof_socket: Option<std::path::PathBuf>,
+    #[arg(long)]
+    config_socket: Option<std::path::PathBuf>,
+    #[arg(long)]
+    pad_socket: Option<std::path::PathBuf>,
+    #[arg(long)]
+    updater_socket: Option<std::path::PathBuf>,
+    /// Local raw camera snapshot endpoint (not the control datachannel).
+    #[arg(long, default_value = duck_ipc_proto::socket::MEDIA)]
+    frame_socket: std::path::PathBuf,
 }
 
-#[cfg(target_os = "linux")]
+// Gated with the `main` that calls it: without a pipeline there is nothing to point at a socket and
+// `-D warnings` would call this dead.
+#[cfg(any(target_os = "linux", feature = "gstreamer"))]
+impl Args {
+    fn sockets(&self) -> mediad::upstream::Sockets {
+        let mut s = mediad::upstream::Sockets::default();
+        if let Some(p) = &self.robot_socket {
+            s.robot = p.clone();
+        }
+        if let Some(p) = &self.tof_socket {
+            s.tof = p.clone();
+        }
+        if let Some(p) = &self.config_socket {
+            s.config = p.clone();
+        }
+        if let Some(p) = &self.pad_socket {
+            s.pad = p.clone();
+        }
+        if let Some(p) = &self.updater_socket {
+            s.updater = p.clone();
+        }
+        s
+    }
+}
+
+#[cfg(any(target_os = "linux", feature = "gstreamer"))]
 fn main() -> ExitCode {
     let args = Args::parse();
     tracing_subscriber::fmt()
@@ -126,19 +217,8 @@ fn main() -> ExitCode {
         }
     };
 
-    // Refused before anything starts: a bad angle is a typo on a command line, and the daemon
-    // should say so rather than opening a camera first.
-    // Validated even when the pipeline will not use it, because it is still what every consumer is
-    // told about the mount — a typo should not reach the console as a rotation nobody can apply.
-    let mount = match mediad::pipeline::Rotation::from_degrees(args.rotate) {
-        Ok(rotation) => rotation,
-        Err(e) => {
-            tracing::error!(error = %e, "mediad cannot start");
-            return ExitCode::FAILURE;
-        }
-    };
-    // What the stream is and what it looks for, from `[media]` and `[detect]` — see
-    // `--config` and `mediad::config`. One file, one read: `[detect]` is `mediad`'s section
+    // What the stream is and what it looks for, from `[media]` and `[duck_detector]` — see
+    // `--config` and `mediad::config`. One file, one read: `[duck_detector]` is `mediad`'s section
     // too, and a second config file for the second daemon that wants one is how a fleet ends
     // up with settings nobody can find.
     let explicit = args.config.is_some();
@@ -147,30 +227,72 @@ fn main() -> ExitCode {
         .clone()
         .unwrap_or_else(mediad::config::default_path);
     let params = mediad::config::load(&config, explicit);
-    let (media, detect) = (params.media, params.detect);
+    // Which sensor the head camera must be: the board's, unless `[media] sensor` forces one.
+    // Whether the board was *declared* is read on its own, because an unset key parses as zero3
+    // and the refusal on a beta that never declared itself should say that, not "wrong camera".
+    let expected = mediad::sensor::Expected::new(
+        params.media.sensor,
+        params.board.version,
+        robotd_params::board::Board::declared(&config).is_some(),
+    );
+    // Refused before anything starts: a bad angle is a typo on a command line, and the daemon
+    // should say so rather than opening a camera first.
+    // Validated even when the pipeline will not use it, because it is still what every consumer is
+    // told about the mount — a typo should not reach the console as a rotation nobody can apply.
+    // The board's mount whatever the source: a quarter turn on the Zero 3W, upright on the beta
+    // (`Board::camera_mount_degrees`). The *simulated* camera is rolled like the Zero 3W's on
+    // purpose, and a twin declares no board, so a frame from a duck in MuJoCo needs the same turn
+    // as a frame from a duck on the desk. Overridable, because a scene could mount it differently.
+    let rotate = args
+        .rotate
+        .unwrap_or_else(|| params.board.version.camera_mount_degrees());
+    let mount = match mediad::pipeline::Rotation::from_degrees(rotate) {
+        Ok(rotation) => rotation,
+        Err(e) => {
+            tracing::error!(error = %e, "mediad cannot start");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (media, detect) = (params.media, params.duck_detector);
+
+    // **What will actually run, not what is configured.** `[media] quality` is the rung a camera
+    // streams at; a test pattern ignores it and runs at `TEST_PATTERN_GEOMETRY`, so a log line
+    // reporting the rung on a board with no camera named a resolution nothing was producing.
+    //
+    // `--sim-camera` wins over `[media] source`, exactly as the source selection further down
+    // does: a simulated camera is a camera, and it renders the configured rung.
+    let (width, height, fps) = if args.sim_camera.is_some() {
+        (
+            media.quality.width(),
+            media.quality.height(),
+            media.quality.fps(),
+        )
+    } else {
+        media.geometry()
+    };
     tracing::info!(
-        camera = media.camera,
+        source = media.source.label(),
         quality = media.quality.label(),
-        width = media.quality.width(),
-        height = media.quality.height(),
-        fps = media.quality.fps(),
+        width,
+        height,
+        fps,
         bitrate = media.bitrate_resolved(),
         congestion_control = media.congestion_control.nick(),
         "streaming"
     );
     // The same angle the detector needs, in its own vocabulary: it folds the turn into the
     // resampling it already does, which is why nothing in the pipeline has to.
-    let turn = match duck_detect::Turn::from_degrees(args.rotate) {
+    let turn = match uyvy::Turn::from_degrees(rotate) {
         Some(turn) => turn,
         None => {
-            tracing::error!(degrees = args.rotate, "mediad cannot start");
+            tracing::error!(degrees = rotate, "mediad cannot start");
             return ExitCode::FAILURE;
         }
     };
 
     let rotation = if args.flip_in_pipeline {
         tracing::warn!(
-            degrees = args.rotate,
+            degrees = rotate,
             "--flip-in-pipeline: rotating in the pipeline costs the encoder its zero-copy path"
         );
         mount
@@ -188,8 +310,9 @@ fn main() -> ExitCode {
         // neither. So this is logged at error and the daemon carries on.
         let page = mediad::web::page(args.port);
         let (web_host, web_port) = (args.host.clone(), args.web_port);
+        let web_frame_socket = args.frame_socket.clone();
         tokio::spawn(async move {
-            if let Err(e) = mediad::web::serve(&web_host, web_port, page).await {
+            if let Err(e) = mediad::web::serve(&web_host, web_port, page, web_frame_socket).await {
                 tracing::error!(
                     error = %format!("{e:#}"),
                     "the console is not being served; video and control are unaffected"
@@ -201,24 +324,101 @@ fn main() -> ExitCode {
         // producer that registered without a name would keep it until this daemon restarts. Costs a
         // unix-socket round trip on a boot where `configd` may not be up yet, which is why it is
         // bounded and why a failure is a warning rather than an exit.
-        let producer =
-            mediad::producer::Producer::learn(Default::default(), duck_ipc_proto::build_info!())
-                .await;
+        let sockets = args.sockets();
+        let mut producer =
+            mediad::producer::Producer::learn(sockets.clone(), duck_ipc_proto::build_info!()).await;
+        // **A camera that is MuJoCo is a simulated robot, whatever `configd` said.** `configd` owns
+        // the fact and this is the backstop for the one case that would be wrong: it is asked once,
+        // with a timeout, on a machine where every daemon starts at the same instant, so a late
+        // answer would register a simulated duck as hardware. The two cannot disagree — there is no
+        // arrangement in which the frames come from a simulator and the robot is real.
+        producer.simulated |= args.sim_camera.is_some();
         tracing::info!(
             name = producer.name.as_deref().unwrap_or("unknown"),
             release = %producer.release,
             api_version = producer.api_version,
+            simulated = producer.simulated,
             "producing as"
         );
 
-        let source = if media.camera {
-            mediad::pipeline::Source::Camera(mediad::pipeline::Camera {
-                device: args.camera_device.clone(),
-                exposure: args.exposure,
-                analogue_gain: args.analogue_gain,
-            })
+        // Relay candidates, so a consumer on a network that cannot punch a hole to this robot
+        // still reaches it. Spawned whatever the account state — it is inert without a token and
+        // starts on its own when a login lands — and *before* the pipeline, because the first
+        // consumer's offer is built as the pipeline comes up.
+        let relays = mediad::turn::Relays::empty();
+        // The camera's lines in the vet book, reported to `robotd` once a minute.
+        tokio::spawn(mediad::vetbook::report());
+        tokio::spawn(mediad::turn::maintain(
+            std::sync::Arc::clone(&relays),
+            args.token.clone(),
+            args.turn_url.clone(),
+        ));
+
+        // What a control lane can say about this robot's own media: the picture's geometry, and
+        // the frame streamer. Empty until the pipeline is up — `pinned_sensor()` is only truthful
+        // once something has tried to set it, and there are no frames to encode before then — and
+        // the relay below is spawned before that on purpose, so the answer has to be able to
+        // arrive late rather than be a value passed in now.
+        let (video_tx, video_rx) =
+            tokio::sync::watch::channel::<Option<mediad::session::Media>>(None);
+
+        // The outward half of remote access, and it is deliberately *after* the producer is
+        // learned: the name a client sees in the service's listing comes from the same place the
+        // local `meta` gets it, and a relay that registered first would publish an unnamed robot
+        // until the next restart.
+        //
+        // Spawned whatever happens next. It is inert without a token, it holds no lock, and a
+        // pipeline that fails to build should not take remote access down with it — a robot that
+        // appears in its owner's list and cannot stream is still a robot somebody can reach to
+        // find out why.
+        if args.no_remote {
+            tracing::info!("--no-remote: this robot will not register with the rendezvous service");
         } else {
-            mediad::pipeline::Source::Test
+            match mediad::relay::Meta::of(&producer, None) {
+                None => tracing::warn!(
+                    "no serial and no machine id, so this robot has no stable identity to \
+                     register with; remote access is off"
+                ),
+                Some(meta) => {
+                    if let Some(relay) =
+                        mediad::relay::Relay::new(
+                            &args.rendezvous_url,
+                            &args.token,
+                            meta,
+                            sockets.clone(),
+                            duck_ipc_proto::remote_status_path(),
+                        )
+                    {
+                        // The bridge is a *consumer* of the signalling server this same process
+                        // runs, so it has to be told the port `--port` chose rather than assuming
+                        // the default — a robot moved off 8443 would otherwise register happily
+                        // and fail every session.
+                        tokio::spawn(
+                            relay
+                                .with_local_signalling(format!("ws://127.0.0.1:{}", args.port))
+                                .with_video(video_rx.clone())
+                                .run(),
+                        );
+                    }
+                }
+            }
+        }
+
+        // Matched rather than tested, so a source added to `MediaSource` fails the build here
+        // instead of quietly arriving as a test pattern.
+        let source = match args.sim_camera.clone() {
+            Some(addr) => mediad::pipeline::Source::Sim(addr),
+            None => match media.source {
+                robotd_params::MediaSource::Camera => {
+                    mediad::pipeline::Source::Camera(mediad::pipeline::Camera {
+                        device: args.camera_device.clone(),
+                        exposure: args.exposure,
+                        analogue_gain: args.analogue_gain,
+                        expected,
+                    })
+                }
+                robotd_params::MediaSource::Test => mediad::pipeline::Source::Test,
+            },
         };
 
         // Frame size and rate are still pinned rather than negotiated — both branches of the tee
@@ -231,9 +431,9 @@ fn main() -> ExitCode {
             port: args.port,
             bitrate: media.bitrate_resolved(),
             congestion_control: media.congestion_control,
-            width: media.quality.width(),
-            height: media.quality.height(),
-            fps: media.quality.fps(),
+            width,
+            height,
+            fps,
             rotation,
         };
 
@@ -241,17 +441,50 @@ fn main() -> ExitCode {
         // `get_frame` surface in `architecture.md` §5.3 is what the rest of it is for. The branch
         // runs from the start rather than being added later, because a tee inserted into a live
         // pipeline is a different and much harder problem than a tee that was always there.
-        let (_pipeline, mut channels, frames) =
-            match mediad::pipeline::start(source.clone(), &producer, &settings) {
-                Ok(started) => started,
-                Err(e) => {
-                    // The message names which step failed and what usually causes it — a missing
-                    // plugin, a missing library, or a device node nobody can open. Those look
-                    // identical from a log line that only says "failed".
-                    tracing::error!(error = %format!("{e:#}"), "mediad cannot start");
-                    return ExitCode::FAILURE;
-                }
-            };
+        let (_pipeline, mut channels, frames, stream_branch, peers) = match mediad::pipeline::start(
+            source.clone(),
+            &producer,
+            &settings,
+            std::sync::Arc::clone(&relays),
+        ) {
+            Ok(started) => started,
+            Err(e) => {
+                // The message names which step failed and what usually causes it — a missing
+                // plugin, a missing library, or a device node nobody can open. Those look
+                // identical from a log line that only says "failed".
+                tracing::error!(error = %format!("{e:#}"), "mediad cannot start");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        // A recorder or perception process asks the local Unix socket for one raw frame. It is
+        // deliberately not the datachannel: a snapshot is camera-sized, and control has to stay
+        // prompt even while a slow local reader is being served. `npu-bringup.md` names this.
+        let (frame_lock, frame_listener) = match mediad::frame::bind(&args.frame_socket).await {
+            Ok(bound) => bound,
+            Err(error) => {
+                tracing::error!(error = %error, "cannot bind media.frame; refusing a partial start");
+                return ExitCode::FAILURE;
+            }
+        };
+        let frame_source = frames.clone();
+        // The mount angle every frame header carries — and zero when the pipeline was asked to
+        // flip, for the detector's sampler and the JPEG streamer's reason: those pixels arrive
+        // upright already, and turning them twice is a picture on its side with nothing to say why.
+        let frame_rotate = if args.flip_in_pipeline { 0 } else { rotate };
+        // What `media.laser` turns a pixel into a direction with — filled in below, once the
+        // intrinsics are known, which is only after the pipeline has pinned a sensor mode — and
+        // where every look is broadcast, for the console's overlay.
+        let laser_hub = std::sync::Arc::new(mediad::laser::Hub::default());
+        let frame_laser = laser_hub.clone();
+        tokio::spawn(async move {
+            let _lock = frame_lock;
+            if let Err(error) =
+                mediad::frame::serve(frame_listener, frame_source, frame_rotate, frame_laser).await
+            {
+                tracing::error!(error = %format!("{error:#}"), "media.frame endpoint stopped");
+            }
+        });
 
         // After the pipeline, because it meters the pipeline's own frames — and only with a real
         // camera, since a test pattern has no sensor to write and the loop would spend the daemon's
@@ -259,25 +492,47 @@ fn main() -> ExitCode {
         //
         // `_exposure` is the handle that stops the thread; it lives as long as this scope, which is
         // as long as the daemon.
+        // V4L2 controls through `ioctl`, so it exists only where a real camera can. Nothing else
+        // in this function cares: the other two sources have no sensor to meter.
+        #[cfg(target_os = "linux")]
         let _exposure = match (&source, args.no_auto_exposure) {
-            (mediad::pipeline::Source::Camera(camera), false) => Some(mediad::exposure::spawn(
-                camera.device.clone(),
-                frames.clone(),
-                camera.exposure,
-                camera.analogue_gain,
-            )),
+            // The pipeline found the sensor to start at all, so this is always `Some` here.
+            (mediad::pipeline::Source::Camera(camera), false) => {
+                mediad::pipeline::sensor().and_then(|found| match found.sensor.metering {
+                    mediad::sensor::Metering::Mediad => {
+                        let (exposure, analogue_gain) = camera.starting(found.sensor);
+                        Some(mediad::exposure::spawn(
+                            camera.device.clone(),
+                            frames.clone(),
+                            found.sensor.exposure,
+                            exposure,
+                            analogue_gain,
+                        ))
+                    }
+                    // A second loop on the same sensor fights the engine; `Metering` has the
+                    // measurement.
+                    mediad::sensor::Metering::Rkaiq => {
+                        tracing::info!(
+                            sensor = found.sensor.name(),
+                            "auto-exposure is the 3A engine's on this sensor; mediad does not meter"
+                        );
+                        None
+                    }
+                })
+            }
             (mediad::pipeline::Source::Camera(_), true) => {
                 tracing::info!(
-                    exposure = args.exposure,
-                    analogue_gain = args.analogue_gain,
-                    "--no-auto-exposure: the picture stays at the starting exposure"
+                    "--no-auto-exposure: the picture stays at the starting exposure the head \
+                     camera line gave"
                 );
                 None
             }
             (mediad::pipeline::Source::Test, _) => None,
+            // A simulated camera has no sensor to write, and its brightness is the renderer's.
+            (mediad::pipeline::Source::Sim(_), _) => None,
         };
 
-        // **The duck detector, from the same config file as everything else.** `[detect]` lives in
+        // **The duck detector, from the same config file as everything else.** `[duck_detector]` lives in
         // robotd.toml because that is the file `robotctl configure` edits and a robot has one place
         // for its switches — even though it is this daemon that reads that section.
         //
@@ -286,14 +541,14 @@ fn main() -> ExitCode {
         // boot because a model file moved" is a bad trade.
         let models = detect.models();
         let detector = if models.is_empty() {
-            tracing::info!("duck detector off ([detect] enabled = false, or no model)");
+            tracing::info!("duck detector off ([duck_detector] enabled = false, or no model)");
             None
         } else {
             // The frames on the tee are as the camera took them — unless the pipeline was asked
             // to flip, in which case they are upright already and the sampler must not turn them
             // again.
             let sampler_turn = if args.flip_in_pipeline {
-                duck_detect::Turn::None
+                uyvy::Turn::None
             } else {
                 turn
             };
@@ -317,18 +572,116 @@ fn main() -> ExitCode {
 
         // What every peer is told about the picture. The geometry is the *encoded* frame — the
         // pipeline does not rotate, so it is the capture geometry — and the rotation is the mount.
-        let video = mediad::session::Video {
-            width: media.quality.width(),
-            height: media.quality.height(),
-            rotate: args.rotate,
+        // The camera's geometry, for a consumer that has to turn pixels into directions. Read
+        // *after* the pipeline is up, because which sensor mode is in force is only known once
+        // something tried to set it — and a mode nobody knows the field of view of publishes
+        // nothing rather than a plausible wrong number. `mediad::camera` has the arithmetic.
+        let intrinsics = if args.sim_camera.is_some() {
+            // The MuJoCo twin renders a known field of view, so publish its exact geometry — twin
+            // recordings then self-describe (no `--calib` needed on the duckslam side).
+            mediad::camera::Intrinsics::sim(width, height)
+        } else {
+            mediad::camera::Intrinsics::published(
+                media.intrinsics.as_ref(),
+                mediad::pipeline::pinned_sensor(),
+                width,
+                height,
+            )
         };
+        match &intrinsics {
+            Some(geometry) => tracing::info!(
+                fx = geometry.fx,
+                fy = geometry.fy,
+                cx = geometry.cx,
+                cy = geometry.cy,
+                calibrated = geometry.calibrated,
+                "camera geometry"
+            ),
+            None => tracing::info!(
+                "no camera geometry to publish: the sensor is not in a mode whose field of view \
+                 is known, so a consumer is told nothing rather than something wrong"
+            ),
+        }
+
+        // The laser detector's geometry: these intrinsics, and the same turn the duck detector's
+        // sampler gets — none when the pipeline already flipped the frames.
+        if let Some(geometry) = &intrinsics {
+            let _ = laser_hub.geometry.set(mediad::laser::Geometry::from_intrinsics(
+                geometry,
+                if args.flip_in_pipeline {
+                    uyvy::Turn::None
+                } else {
+                    turn
+                },
+            ));
+        }
+
+        let video = mediad::session::Video {
+            width,
+            height,
+            rotate,
+            intrinsics,
+        };
+
+        // Frames out to a WebSocket this robot dials, when something asks for them. Built here
+        // because it needs the tee — and given the same `turn` the detector's sampler gets, for
+        // the same reason: a pipeline that was asked to flip has already turned the frames, and
+        // turning them twice is a picture on its side with nothing to say why.
+        let streamer = std::sync::Arc::new(mediad::stream::Streamer::new(
+            mediad::stream::Encoders {
+                // The same `turn` the detector's sampler gets, and for the same reason: a pipeline
+                // asked to flip has already turned the frames, and turning them twice is a
+                // picture on its side with nothing to say why.
+                jpeg: mediad::stream::jpeg_encoder(
+                    frames.clone(),
+                    if args.flip_in_pipeline {
+                        uyvy::Turn::None
+                    } else {
+                        turn
+                    },
+                ),
+                // The H.264 branch turns nothing: it is downstream of the same tee, so the flip —
+                // or its absence — is already in the pixels it encodes.
+                h264: stream_branch.clone().map(mediad::stream::h264_encoder),
+                gate: stream_branch.clone().map(|branch| {
+                    std::sync::Arc::new(move |open: bool| {
+                        if open {
+                            branch.open();
+                        } else {
+                            branch.close();
+                        }
+                    }) as std::sync::Arc<dyn Fn(bool) + Send + Sync>
+                }),
+            },
+            producer.clone(),
+            // The resolved mount angle, not the flag: `--rotate` is an `Option` now and the
+            // default lives in one place at the top of `main`.
+            rotate,
+            &args.token,
+        ));
+
+        // The camera LED, for as long as the pipeline lives. A crashed mediad leaves it as it was;
+        // `ExecStopPost` in the unit switches it off.
+        {
+            let streamer = std::sync::Arc::clone(&streamer);
+            tokio::spawn(mediad::indicator::run(peers, move || streamer.is_streaming()));
+        }
+
+        let media = mediad::session::Media {
+            video: video.clone(),
+            streamer: std::sync::Arc::clone(&streamer),
+        };
+
+        // The relay has been up since before the pipeline; this is the point its control lanes can
+        // start answering for the robot's own media.
+        let _ = video_tx.send(Some(media.clone()));
 
         // One session per peer, each with its own connections to the services it talks to. Per
         // peer rather than shared, so one peer's minutes-long update cannot silence another's
         // telemetry — which is the same reason a session keeps one connection per lane.
         while let Some(channel) = channels.recv().await {
             let (replies_tx, mut replies_rx) = tokio::sync::mpsc::channel::<String>(256);
-            let pool = mediad::upstream::Pool::new(Default::default(), replies_tx);
+            let pool = mediad::upstream::Pool::new(sockets.clone(), replies_tx);
 
             let to_peer = channel.outbound.clone();
             tokio::spawn(async move {
@@ -343,7 +696,7 @@ fn main() -> ExitCode {
             // (`media.video`), which is why that path exists and this one is best-effort.
             {
                 let to_peer = channel.outbound.clone();
-                let line = mediad::session::video_notification(video);
+                let line = mediad::session::video_notification(&video);
                 tokio::spawn(async move {
                     let _ = to_peer.send(line).await;
                 });
@@ -376,11 +729,41 @@ fn main() -> ExitCode {
                 });
             }
 
+            // The laser detector's looks, for the console to draw over the video. Only while
+            // something has tracking on — the detector runs for robotd's subscription, never for
+            // a peer — and the newest look is all a slow peer needs, as with the ducks.
+            {
+                let mut dots = laser_hub.dots.subscribe();
+                let to_peer = channel.outbound.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match dots.recv().await {
+                            Ok(dot) => {
+                                if to_peer
+                                    .send(mediad::laser::notification(&dot))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                });
+            }
+
             tokio::spawn(mediad::session::run(
                 channel.inbound,
                 channel.outbound,
                 pool,
-                video,
+                // Cloned per session: it carries the camera's intrinsics and a handle to the
+                // frame streamer. Always `Some` here — a datachannel exists because the pipeline
+                // handed over a consumer, so by definition there is media behind it.
+                Some(media.clone()),
+                // And one of the consumers `webrtcsink` counts, which is what makes it a peer.
+                mediad::session::Seat::peer(),
             ));
         }
 
@@ -390,12 +773,29 @@ fn main() -> ExitCode {
     })
 }
 
-/// `mediad` is a Linux daemon: it drives GStreamer against a Rockchip VPU and a V4L2 capture path.
-/// The rest of the crate is portable and its tests run anywhere, which is why this is a stub rather
-/// than a `cfg` on the whole crate.
-#[cfg(not(target_os = "linux"))]
+/// Built without a pipeline: the rest of the crate is portable and its tests run anywhere, which is
+/// why this is a stub rather than a `cfg` on the whole crate.
+///
+/// The message names the way out, because the shape of this failure is somebody following the
+/// simulator's instructions and getting a daemon that exits with no picture and no reason.
+#[cfg(not(any(target_os = "linux", feature = "gstreamer")))]
 fn main() -> ExitCode {
     let _ = Args::parse();
-    eprintln!("mediad runs on the robot; this host is not Linux");
+    eprintln!(
+        "this mediad was built without a pipeline, so it has no camera, no console and no \
+         WebRTC.\nOn a robot that cannot happen. Here, build it with GStreamer:\n\n    brew \
+         install gstreamer\n    cargo build -p mediad --features gstreamer\n"
+    );
     ExitCode::FAILURE
+}
+
+#[cfg(test)]
+mod security_defaults {
+    use super::*;
+
+    #[test]
+    fn local_listeners_are_not_exposed_by_default() {
+        let args = Args::try_parse_from(["mediad"]).unwrap();
+        assert_eq!(args.host, "127.0.0.1");
+    }
 }

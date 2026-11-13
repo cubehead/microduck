@@ -14,7 +14,52 @@ below.
 
 ## Getting it
 
-Run it from a clone of this repo:
+On any machine with [`uv`](https://docs.astral.sh/uv/) — Linux, macOS or Windows:
+
+```bash
+uvx duckctl --name <robot-name> info
+```
+
+That runs the latest release, downloaded once and cached; nothing is compiled. To have a plain
+`duckctl` on the PATH instead, `uv tool install duckctl` (`uv tool upgrade duckctl` to move it on).
+It is the build of the latest `daemon-v*` release, so it can be behind `main`;
+[`ci-setup.md`](../project/ci-setup.md#duckctl-on-pypi) has how it is published.
+
+With Homebrew, on macOS or Linux:
+
+```bash
+brew install pierre-rouanet/tools/duckctl
+```
+
+`brew upgrade duckctl` moves it to each new release.
+
+For what a branch last built — `main` included — on Linux or macOS:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/pollen-robotics/microduck/main/scripts/install-duckctl.sh | sh
+```
+
+It installs what `main` last built to `~/.local/bin`. For another branch's build, name it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/pollen-robotics/microduck/main/scripts/install-duckctl.sh | sh -s -- udp-pad
+```
+
+On Windows, in PowerShell:
+
+```powershell
+irm https://github.com/pollen-robotics/microduck/releases/download/daemon-dev-main/duckctl-windows-x86_64.zip -OutFile duckctl.zip
+```
+
+```powershell
+Expand-Archive duckctl.zip -DestinationPath .
+```
+
+Every branch push publishes these builds on the `daemon-dev-<branch>` prerelease, beside the daemon. A macOS binary
+downloaded in a browser rather than with the script is quarantined; clear it with
+`xattr -d com.apple.quarantine duckctl`.
+
+With a Rust toolchain, run it from a clone of this repo:
 
 ```bash
 cargo run -q -p duckctl -- --name <robot-name> info
@@ -25,6 +70,14 @@ Or install it once, at the cost of a snapshot that no longer follows the branch:
 ```bash
 cargo install --path duckctl
 ```
+
+Without a clone, the same from GitHub — `main`, or add `--branch <name>` for another:
+
+```bash
+cargo install --locked --git https://github.com/pollen-robotics/microduck duckctl
+```
+
+Building needs no system headers: libdbus is compiled in. Then:
 
 ```bash
 duckctl --name <robot-name> info
@@ -67,12 +120,64 @@ it, along with the signal and both addresses.
 For the address on its own:
 
 ```bash
-ssh radxa@$(duckctl ip)
+ssh microduck@$(duckctl ip)
 ```
 
 `ip` prints the address and nothing else, so it substitutes. It reads the advertisement, so it
 connects to nothing, needs no PIN, and takes about a second — and the answer is not stale: `btd`
 re-reads the address every five seconds and re-advertises when it moves.
+
+Or skip the substitution:
+
+```bash
+duckctl ssh
+```
+
+```bash
+duckctl ssh -- sudo robotctl pad pair
+```
+
+`ssh` finds the address the way `ip` does and then becomes `ssh`, so the prompts, the terminal and
+the exit status are ssh's own. The account is `--user`, else `DUCK_BOARD_USER` from the environment
+— the variable [`dev-push.sh`](dev-push.md) reads, so a laptop set up for pushing is set up for this
+— else `microduck`. Words after `--` run on the robot instead of opening a shell.
+
+A shipping image answers ssh only on the head's USB-C link (`microduck@192.168.42.1`), never on
+wifi (microduck_yocto#110), so over wifi `duckctl ssh` stops with "refused ssh" before ssh would.
+That is deliberate, and there is no way to change it from Bluetooth: a shell on wifi means opening
+the robot. Over the USB link, `sudo touch /run/microduck-ssh-wifi` opens it until the next reboot;
+or flash the dev image, which keeps ssh open on wifi.
+
+`ssh` and `scp` remember where they last found each robot, in `~/.cache/duckctl/addresses`
+(`$XDG_CACHE_HOME` if set), and try that address first: if something answers on port 22 within a
+second, the scan is skipped. If nothing does — the robot moved, is off, or the laptop is on another
+network — it scans as before and remembers the new address. A lease handed to another machine shows
+up as ssh's host-key warning; `duckctl ip` always scans, and refreshes the file as it does.
+
+Files go the same way:
+
+```bash
+duckctl scp report.md :/tmp/
+```
+
+```bash
+duckctl scp :/var/log/robotd.log .
+```
+
+A path starting with `:` is on the robot — `scp`'s own `host:path` with the host left out, since the
+host is the part this finds for you. Everything else reaches `scp` as typed, `-r` and the rest of
+its flags included, and the progress meter and the exit status are `scp`'s own. The account resolves
+the way `ssh`'s does.
+
+This tool's own flags come first, before the paths:
+
+```bash
+duckctl --name ducky scp -r logs/ :/tmp/
+```
+
+A copy with no `:` anywhere in it is refused before the scan, because it is a local-to-local copy
+that no robot is party to and nothing in `scp`'s output would say so. A local file that really is
+named `:foo` is `./:foo`.
 
 A robot bonded to this machine often stops advertising the service to it, and then `ip` connects and
 asks `net.status` instead. That is slower and needs the PIN, and it always answers. `--verbose` says
@@ -113,17 +218,19 @@ The robot serves a page that streams its camera and drives it:
 duckctl open
 ```
 
-Finds the robot, then opens `http://<address>:8080/` in a browser. `--print` gives the URL instead,
-for a machine with no browser or for a script; `--port` for a robot started with a non-default
-`mediad --web-port`.
-
-Nothing to install and nothing to serve — `mediad` embeds the page, so a robot running that daemon
-is a robot with a console.
+Finds the robot, then runs a small bridge on this machine and opens it in a browser; Ctrl-C closes
+it. `--print` gives the URL instead of opening a browser. It needs the robot's setup code
+(`duckctl setup-code add`), because since daemon 0.19 the robot serves its console on its own
+loopback and the LAN reaches it only through the authenticated media gateway. The page is this
+duckctl's copy, so keep duckctl current. Why it works this way, and what the bridge checks before
+it lets a browser through:
+[`webrtc-console.md` §2.2](../design/webrtc-console.md#22-duckctl-open).
 
 What is on it: the camera with the link's bitrate, frame rate, loss and round trip beside it; two
 pads and the keys `W`/`A`/`S`/`D` and `Q`/`E` to drive, at a gamepad's 0.3 m/s and 1.5 rad/s; a drag
-on the picture to look at a point; enable, init, relax, stop and shutdown; the skills and the voice
-bank as menus; and the state stream at 2 Hz beside `robot.health`, which is where a hot servo, a flat
+on the picture to look at a point; enable, init, relax, stop and shutdown; the voice bank as a
+menu and **the skills as a menu the robot fills** — which skills a robot has is config, so the
+page asks `robot.policies` rather than offering a list it guessed; and the state stream at 2 Hz beside `robot.health`, which is where a hot servo, a flat
 pack or a loop running slow gets named.
 
 `stop` zeroes the intents the page is sending. **It is not an emergency stop** — nothing in this
@@ -160,6 +267,28 @@ duckctl info
 export DUCK_PIN=418299
 ```
 
+### A robot with a setup code
+
+A robot with a setup code — `sudo robotctl system setup-code` on it prints one — is in secure mode:
+it refuses the PIN and serves only a client that proves the code's key, in the handshake
+[`btd/src/secure.rs`](../../btd/src/secure.rs) answers. Store the code once and every command finds
+it by the robot's name:
+
+```bash
+duckctl ssh -- sudo robotctl system setup-code   # prints md1:<robot id>:<key>, and the QR
+duckctl setup-code add                           # paste it; read on stdin, kept out of history
+```
+
+`duckctl ssh` needs no code, since the address comes from the advertisement — so a robot already on
+a network is where to copy it from. The text under the QR works too, label serial and all. Given
+`--name` (or `DUCK_ROBOT`) that differs from the id in the code, `add` files it under both, and
+`duckctl name` files it under the new name; `setup-code list` shows what is held and `setup-code
+remove <name>` forgets one. The file is `~/.config/duckctl/setup-codes`, mode `0600`, and it is a
+credential: whoever copies it can talk to the robot.
+
+A wrong key is a silence, not a refusal — the robot drops the link — so a stale code shows up as a
+failed handshake that names both causes: the wrong code, or a robot with no code at all.
+
 For one command against a different robot, `--name` still wins:
 
 ```bash
@@ -183,6 +312,13 @@ duckctl --name <robot-name> info
 ```
 
 Name, serial and uptime.
+
+```bash
+duckctl --name <robot-name> quack
+```
+
+The robot quacks in its own voice — every voice is generated from the serial — so the duck that
+answers is the one the name reached. A muted robot refuses and says so rather than staying silent.
 
 ```bash
 duckctl --name <robot-name> name <new-name>
@@ -218,7 +354,8 @@ duckctl --name <robot-name> wifi connect <ssid> --psk <passphrase>
 ```
 
 Omit `--psk` for an open network. Joining disconnects the robot from the network it is on, so an ssh
-session over wifi drops; that is the command working. It can take up to 45 seconds to answer.
+session over wifi drops; that is the command working. It can take up to a minute to answer, and
+prints each step on the way (`· joining <ssid>: checking the passphrase`).
 
 ```bash
 duckctl --name <robot-name> wifi forget <ssid>
@@ -231,6 +368,22 @@ duckctl --name <robot-name> health
 ```
 
 Whether the control loop is healthy.
+
+```bash
+duckctl --name <robot-name> reboot-motors
+```
+
+The way back from a servo in hardware error — overload, overheating, electrical shock — which
+otherwise holds torque off until the battery is pulled. `health` names the joint. Add ids to reboot
+only those:
+
+```bash
+duckctl --name <robot-name> reboot-motors 3 11
+```
+
+**Torque goes off on every joint first**, so hold the robot or have it lying down. It stays limp
+afterwards, with the gains restored on the next write — press Start on the pad, or
+`duckctl call robot.init`, to stand it back up.
 
 ```bash
 duckctl --name <robot-name> status
@@ -246,6 +399,50 @@ duckctl --name <robot-name> version
 
 The API version, the release, and the git revision it was built from. A `revision` of `null` means
 the release was built on somebody's laptop rather than by CI.
+
+## Logs
+
+```bash
+duckctl --name <robot-name> logs robotd
+```
+
+The last 40 lines of that daemon's journal, this boot. For more, and for the boot before this one:
+
+```bash
+duckctl --name <robot-name> logs robotd -n 200
+```
+
+```bash
+duckctl --name <robot-name> logs btd --boot -1
+```
+
+Readable units: `updaterd`, `robotd`, `configd`, `btd`, `padd`, `mediad`, `tofd`, plus
+`bluetooth` and `NetworkManager`. The `.service` suffix is optional, and anything else comes back
+refused with that list.
+
+Lines go to stdout and everything else to stderr, so `logs robotd -n 200 | grep -i panic` works.
+A long tail is trimmed to what the radio can carry, oldest lines first, with a note saying so.
+
+A tail that spans a restart says where:
+
+```
+2026-09-09T12:27:20+00:00 systemd[1]: Starting robotd.service - Robot control daemon...
+-- new robotd process, pid 3227 --
+2026-09-09T12:27:21+00:00 robotd[3227]: control loop running joints=15 hz=50.0 driving=true
+```
+
+Which matters after an update, when forty lines carry two different builds' output. Anything in
+`-- … --` comes from the robot rather than the journal.
+
+There is no `-f`, no `--since` and no search. For those, ssh in:
+
+```bash
+ssh microduck@$(duckctl --name <robot-name> ip)
+```
+
+```bash
+journalctl -u robotd -f
+```
 
 ## Updates
 
@@ -332,6 +529,259 @@ duckctl --name <robot-name> update watch
 It prints where the update in flight has got to and then everything that follows. It never receives
 a reply, so it ends with Ctrl-C.
 
+## The operating system
+
+`update` above installs the daemon release. `os` installs the whole root filesystem, into the A/B
+slot the robot is not running, and every change ends in a reboot. Only a robot flashed with a
+`microduck_yocto` image has slots; any other answers error 15, "cannot be updated over the air".
+
+Which build each slot holds, what the robot's channel offers, and how an update is going:
+
+```bash
+duckctl --name <robot-name> os status
+```
+
+Ask the channel what is newest, changing nothing:
+
+```bash
+duckctl --name <robot-name> os check
+```
+
+Install the channel's newest:
+
+```bash
+duckctl --name <robot-name> os apply
+```
+
+Or a given build from `os status`'s `builds` list, older ones included:
+
+```bash
+duckctl --name <robot-name> os apply --build 20261028093000
+```
+
+`apply` answers once the download has started, not when it is done. The robot then downloads,
+installs and reboots by itself, and is gone for a minute or so. Run `os status` to follow it, and
+again after the reboot: `last_result` says whether the new OS came up, or whether the robot went
+back to the old slot because the new one did not pass its health check.
+
+Going back to the other slot as it is, with no download:
+
+```bash
+duckctl --name <robot-name> os switch
+```
+
+Both refuse while the robot is moving, or while someone is watching it remotely —
+`--interrupt-sessions` lifts the second — and while another update of either kind is running.
+[`updater-design.md`](../design/updater-design.md) §11 has the mechanism.
+
+## The Hugging Face account
+
+```
+duckctl account login
+```
+
+Prints a code and opens <https://hf.co/oauth/device>, where you type it — Hugging Face's device
+page does not accept a code in the URL, so opening saves the navigation and not the typing. **The
+robot does the waiting**, so this tool disconnects as soon as it has printed the code — approve it
+in the browser it opened, or from any other device, then:
+
+```
+duckctl account status
+```
+
+```
+duckctl account logout
+```
+
+This is the one thing that works on a robot that has never seen a network: no wifi means no
+console and no LAN, and Bluetooth is what is left. Signing in over BLE is the same flow the setup
+wizard runs.
+
+```
+duckctl account login --no-open
+```
+
+for the code and the URL without a browser — which is also what you get automatically when the
+output is not a terminal, so a script launches nothing.
+
+A robot already signed in refuses and names the account, and so does one still waiting for a code
+to be approved. `--force` replaces either — the abandoned code stops working.
+
+## Policies and skills
+
+What each slot runs, and which skills this robot has:
+
+```bash
+duckctl policy list
+```
+
+The `skills` array is the answer to "what can this robot be asked for". They are config, so it
+differs between robots and there is no list to assume — read it before offering a button.
+
+Run one:
+
+```bash
+duckctl do roulade
+```
+
+**The robot has to be driving.** Press Start on the pad first, or it answers saying so. It needs
+no pad *input* though: the deadman zeroes the twist by itself, so a robot nobody is steering
+stands still and does the thing.
+
+Change what it walks with, live:
+
+```bash
+duckctl policy load walk /opt/robot/policies/current/alpha_walking.onnx
+```
+
+Put that slot back:
+
+```bash
+duckctl policy reset walk
+```
+
+One slot at a time, because the wire call takes one — resetting all seven is
+`robotctl policy reset` on the robot. The path is on the *robot*, and must be absolute.
+
+A load from here **survives a reboot**, exactly as `robotctl policy load` on the robot does: the
+daemon writes the slot into `robotd.toml` before it swaps. `duckctl policy reset <slot>` is the
+undo.
+
+Re-read every slot from the config file, for when something else changed it:
+
+```bash
+duckctl policy reload
+```
+
+The robot goes to its home pose with torque on, loads, and drives again — a few seconds, and the
+timeout allows for it. A file that is not `obs[1,61] -> actions[1,14]` is refused before anything
+changes, and a load that fails anyway keeps the policy that was running.
+
+### From the Hub
+
+What else is published for this robot, and whether the official set has moved:
+
+```bash
+duckctl policy search microduck
+```
+
+```bash
+duckctl policy check
+```
+
+Install the newest official set — or `--version v1` to go back:
+
+```bash
+duckctl policy update
+```
+
+Download somebody else's, without running it. The robot refuses until
+`policy.allow_community` is `true` in `sudo robotctl configure` on it:
+
+```bash
+duckctl policy fetch RemiFabre/microduck-flamingo-cycle
+```
+
+The reply names the path it landed at. `load` takes a path and never `org/repo`: fetching and
+loading are two calls here where `robotctl` spells both with one string.
+
+### Giving it a name
+
+`fetch` downloads a file; this makes it something `robot do` answers to:
+
+```bash
+duckctl policy skill polite-bow --path /var/lib/robot/policies/fffiloni/microduck-polite-bow-b1d864/main/policy.onnx --duration 4
+```
+
+```bash
+duckctl do polite-bow
+```
+
+One call — the robot writes its config and reloads, so nothing restarts. `--duration` is required
+the first time and kept afterwards, so changing one field means sending one field:
+
+```bash
+duckctl policy skill polite-bow --command 1,0,0
+```
+
+`--command` is the twist fed to the network while it runs, zeros unless the policy reads its twist
+as something else — flamingo's is `[flag, side, 0]`. `--unwind` and `--unwind-s` are how a policy
+that holds until told otherwise is brought back.
+
+What this robot can be asked to do, and the timings behind each:
+
+```bash
+duckctl policy skills
+```
+
+`built_in` in that answer names `ground_pick` and `sit_toggle`, which `robot do` also accepts but
+which are driven by the robot itself and are not table entries.
+
+```bash
+duckctl policy unskill polite-bow
+```
+
+A skill this robot's release ships comes back when you do that, because removing the entry only
+removes the override.
+
+Nothing a stranger publishes is verified by anybody. What makes it safe to try is the manifest
+gate before the download, the shape gate at load, the joint clamps and the fall reflex — not the
+description. Have the robot on its stand the first time.
+
+## Which button runs which skill
+
+```bash
+duckctl pad bindings
+```
+
+```bash
+duckctl pad bind x polite-bow
+```
+
+```bash
+duckctl pad reset x
+```
+
+**Nothing restarts and nothing else is needed** — `padd` re-reads the file within a second. The
+name is checked against this robot's skills first, so a typo comes back as a refusal naming the
+real ones rather than becoming a button that does nothing when pressed.
+
+The listing marks two things a client cannot work out for itself: `overridden`, so somebody's
+changes are visible without knowing the defaults, and `error`, for a button bound to a skill this
+robot no longer has — the realistic way to get one of those is removing a skill, not mistyping.
+
+`""` switches a button off, which is a different wish from `pad reset` putting it back to what the
+robot ships with. Six buttons are bindable: `a`, `b`, `x`, `y`, `lb`, `rb` — and `lb`/`rb` are
+the **bumpers**, since the analog triggers are the mouth and the quack.
+
+Pairing a pad is a different namespace and a different daemon — `pad.pair` and `pad.forget` are
+`configd`'s, reached with `call`. These two are `robotd`'s, because checking a skill name needs
+the list of skills.
+
+## A pad on this machine, over UDP
+
+```bash
+duckctl udp-pad
+```
+
+Sends the state of the gamepad a button is pressed on (or `--pad N`) to a duck whose
+`[netpad] enabled` is true. The address is found the way `ip` finds it, so `--name` picks the robot;
+give one instead (`duckctl udp-pad 192.168.1.42`) and no Bluetooth is involved at all. `--hz` (10 to 100, default 30) is the most it
+sends a second. One per duck drives several ducks from one laptop. The quack and the wheee play
+from this machine, in a voice of its own, while the duck only opens its mouth; `--mute` keeps this
+machine quiet and `--robot-sound-on` has the duck quack too. It is a LAN tool, and
+[`udp-pad.md`](udp-pad.md) has the setup, several ducks, the laptop's voice, and the wire format.
+
+## Writing an NFC tag
+
+```bash
+duckctl --name <robot-name> nfc-flash walk_mode
+```
+
+The duck asks for a tag with its pad-lost sound; touch a tag to its head within 20 seconds
+(`--timeout`, up to 120). It quacks when the tag took. What is written and what is refused is in
+[`pair-a-gamepad.md`](pair-a-gamepad.md#writing-a-tag).
+
 ## Anything else — `call`
 
 ```bash
@@ -365,12 +815,16 @@ minutes with nothing arriving at all — which is why they are the way to run an
 ## What it prints
 
 Replies go to stdout as pretty JSON, and everything else — progress, diagnosis, what the radio
-saw — to stderr. So `duckctl ... info > reply.json` keeps the two apart, and a JSON-RPC error
+saw — to stderr. `logs` is the exception and prints its lines as lines, since a journal tail in
+escaped JSON is unreadable; a refusal from it still prints as JSON. So `duckctl ... info > reply.json` keeps the two apart, and a JSON-RPC error
 from the robot still exits non-zero. Progress lines start with `·` and are one line each, so
 `update apply > outcome.json` leaves them on screen and keeps the outcome in the file.
 
-One command is one connection: it finds the robot, pairs if it has to, proves the PIN, asks, and
-disconnects.
+One command is one connection: it finds the robot, pairs if it has to, proves the PIN — or the
+setup code, for a robot it holds one for — asks, and disconnects. On Linux it registers a pairing agent of its own
+while it runs, consenting for that robot and refusing everything else, so a first pairing needs no
+desktop Bluetooth settings open — without one BlueZ refuses the bond (`No agent available` in
+`journalctl -u bluetooth`).
 
 Every command gives up after a period of silence rather than after a fixed total, so a slow update
 is never cut off and a robot that stops answering is reported in seconds. A link that *drops* is
@@ -380,11 +834,17 @@ watching, and `update status` afterwards says how it went.
 
 ## What is refused
 
-Motor control (`robot.move`, `robot.head`, `robot.enable`, `robot.stop`, `robot.init`,
-`robot.relax`), high-rate telemetry (`robot.subscribe`), the two update commands a person has to
-mean (`update.pin`, `update.resetToGolden`) and the pairing PIN (`system.pairingPin`,
-`system.setPairingPin`) are refused by `btd` itself and never reach a daemon. They come back as
-error code 14, "not available over Bluetooth".
+Teleop (`robot.move`, `robot.head`, `robot.look`, `robot.pose`, `robot.mouth`), the emergency stop
+(`robot.stop`), letting the joints go (`robot.relax`), high-rate telemetry (`robot.subscribe`), the
+two update commands a person has to mean (`update.pin`, `update.resetToGolden`) and the pairing PIN
+(`system.pairingPin`, `system.setPairingPin`) are refused by `btd` itself and never reach a daemon.
+They come back as error code 14, "not available over Bluetooth".
+
+`robot.do`, `robot.init`, `robot.enable` and `robot.rebootMotors` are **not** in that list, though
+all four move the robot: teleop is a stream of fifty small updates a second, which is what a
+20-byte notification budget cannot carry, and each of these is one request. `robot.relax` is the
+one that stays refused on grounds other than rate — its only outcome is a robot that was holding
+itself up and now is not.
 
 That is a security boundary rather than a missing feature, and each refusal has its reason next
 to it in `btd/src/route.rs` — [`app-path-design.md`](../design/app-path-design.md) §3.1 is the
@@ -411,3 +871,16 @@ sudo pkill bluetoothd
 
 Forgetting the robot in macOS Bluetooth settings does the same thing. On the robot itself,
 `journalctl -u btd -b` says whether the GATT application registered at all.
+
+**After the robot has been reflashed**, a laptop that was bonded with it before still holds its
+half of a bond the robot no longer has: connecting times out every time, though nothing else holds
+the robot. On Linux, `bluetoothctl info <mac>` shows `Paired: yes`, and
+
+```bash
+bluetoothctl remove <mac>
+```
+
+clears it; on macOS, forget the robot in Bluetooth settings. The same goes for a phone: forget the
+robot in the phone's Bluetooth settings, not only in the app. `scan` ignores a device that BlueZ
+remembers but has not heard in this scan — the cached copy of an old advertisement, with an
+address the robot may have left days ago — and `--verbose` says when it does.

@@ -20,8 +20,10 @@ pub struct Sensors {
     pub positions: [f64; NUM_JOINTS],
     /// Joint velocities, rad/s.
     pub velocities: [f64; NUM_JOINTS],
-    /// Present current magnitude, mA. Sign is dropped — direction is inferable from
-    /// velocity, and every consumer so far wants load, not direction.
+    /// Present current magnitude, mA. The sign is dropped by whichever driver fills this —
+    /// [`crate::bus`] takes the absolute value as it unpacks the word — because what every
+    /// consumer so far wants is load. It is not recoverable from `velocities`: a joint holding
+    /// a squat or a foot taking weight is near-zero velocity at non-zero current.
     pub currents_ma: [f64; NUM_JOINTS],
     pub imu: ImuData,
 }
@@ -123,6 +125,30 @@ pub trait RobotIo {
     fn read(&mut self) -> Result<Sensors>;
     fn write(&mut self, targets: &JointTargets) -> Result<()>;
 
+    /// Whether a position write implicitly arms the actuator (Feetech WritePosEx).
+    fn position_write_arms(&self) -> bool {
+        false
+    }
+
+    /// Whether [`Sensors::velocities`] from this backend is a measurement.
+    ///
+    /// [`Sensors`] is fixed-size arrays, so a backend with nothing to report has no way to say
+    /// so in the sample itself — it reports zeros, which is what a robot standing perfectly
+    /// still reports. The wire draws that distinction (`RobotState::velocities` is absent
+    /// rather than zero when nothing measured it), and this is how it learns which it has:
+    /// a real bus answers yes, `FakeIo` answers no until a test states what the servos report.
+    ///
+    /// Defaulted true because a backend that reads real servos has nothing to declare.
+    fn measures_velocity(&self) -> bool {
+        true
+    }
+
+    /// The same question for [`Sensors::currents_ma`], separately: the simulator reports
+    /// velocity from the physics and may have no load to report at all.
+    fn measures_load(&self) -> bool {
+        true
+    }
+
     /// Set the position P gain on every joint.
     ///
     /// Here rather than in the bus layer alone because it is what makes "go limp" mean
@@ -142,6 +168,14 @@ pub trait RobotIo {
     /// never because a process began.
     fn set_torque(&mut self, on: bool) -> Result<()>;
 
+    /// Reboot one servo: the Protocol 2 REBOOT instruction.
+    ///
+    /// The way out of a latched hardware error — overload, overheating, electrical shock, the
+    /// `shutdown` mask — which otherwise holds torque off until the battery is pulled. The servo is
+    /// off the bus for a few hundred milliseconds and comes back with torque off and its RAM
+    /// registers, the gains among them, at their EEPROM defaults; the caller owns putting them back.
+    fn reboot(&mut self, id: u8) -> Result<()>;
+
     /// Supply voltage and case temperatures, in one extra transaction.
     ///
     /// Not part of [`Sensors`], and not on the tick's critical path: these registers sit at
@@ -149,6 +183,68 @@ pub trait RobotIo {
     /// costs a transaction of its own — about a millisecond. Negligible once a second, 5% of
     /// the budget at 50 Hz.
     fn slow_sensors(&mut self) -> Result<SlowSensors>;
+    /// Each servo's `Hardware Error Status` (register 70), in joint order: the latched alert bits
+    /// — input voltage, overheating, motor encoder, electrical shock, overload — that hold torque
+    /// off until a reboot. The servos keep no log of their own; this is the nearest thing, and
+    /// the vet book counts each bit as it comes up.
+    ///
+    /// `None` from a backend with no servos to ask, which is the default.
+    fn hardware_errors(&mut self) -> Result<Option<[u8; NUM_JOINTS]>> {
+        Ok(None)
+    }
+
+    /// Each servo's model number and firmware version (registers 0 and 6), in joint order. Read
+    /// once a start, for the vet book: a servo has no serial number, so this is all the identity
+    /// it has. `None` from a backend with no servos, which is the default.
+    fn servo_identity(&mut self) -> Result<Option<[ServoIdentity; NUM_JOINTS]>> {
+        Ok(None)
+    }
+
+    /// Each servo's impact guard state (register 66 on [`crate::model::IMPACT_GUARD_FIRMWARES`]),
+    /// in joint order: 0 armed, 1 braking after an impact, 2 holding softly until the goal comes
+    /// back past the position. A servo on any other firmware answers whatever its unused register
+    /// holds, so the caller masks those out. A transaction of its own, about a millisecond.
+    ///
+    /// `None` from a backend with no servos to ask, which is the default.
+    fn impact_guard(&mut self) -> Result<Option<[u8; NUM_JOINTS]>> {
+        Ok(None)
+    }
+
+    /// Ping every expected servo and the IMU board: which of them are on the bus at all.
+    ///
+    /// For a running loop whose reads have started failing. A failed sync read says the bus
+    /// transaction failed, not why, and the two answers lead to different places: a servo that
+    /// no longer answers a ping is a cable or a connector, while everything answering and the
+    /// read still failing is the code that reads. Costs a transaction per device and a timeout
+    /// per silent one, so it is asked about a run of failures, never on a tick.
+    ///
+    /// `None` from a backend with no servos to ping, which is the default.
+    fn census(&mut self) -> Result<Option<Census>> {
+        Ok(None)
+    }
+}
+
+/// Who answered a ping — see [`RobotIo::census`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Census {
+    /// Expected servo IDs ([`crate::model::JOINT_IDS`]) that did not answer, in that order.
+    pub missing: Vec<u8>,
+    /// Whether the IMU board answered.
+    pub imu_answers: bool,
+}
+
+impl Census {
+    /// Something on the bus is silent.
+    pub fn anything_missing(&self) -> bool {
+        !self.missing.is_empty() || !self.imu_answers
+    }
+}
+
+/// What a servo can say about itself — see [`RobotIo::servo_identity`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServoIdentity {
+    pub model: u16,
+    pub firmware: u8,
 }
 
 /// The IMU half of the seam.
@@ -161,6 +257,11 @@ pub trait RobotIo {
 /// ([`crate::ftbus::FeetechIo`]) the same call is the unicast read of ID 200; a failure
 /// degrades the tick the same way an I²C miss does.
 pub trait ImuIo {
+    /// The simulator already returns orientation alongside its joint sample.
+    fn use_joint_sample(&self) -> bool {
+        false
+    }
+
     /// Read one IMU sample (50 Hz, called on the same tick as the servo read).
     ///
     /// An error here must not fail the tick — the caller keeps its previous [`ImuData`].
@@ -198,12 +299,32 @@ pub struct FakeIo {
     pub slow: Option<SlowSensors>,
     /// When true, `read` reports the last written targets as the present positions.
     track_targets: bool,
+    write_arms: bool,
+    /// Whether a test has stated what the servos report for velocity and load. Until one has,
+    /// this fake declares it measures neither — a `--fake` robot is not a robot standing still
+    /// under no load, and a dashboard must be able to tell those apart.
+    velocity_stated: bool,
+    load_stated: bool,
     /// Last torque state commanded, or `None` if nothing ever asked. `None` is the assertion that
     /// matters most: it is what "a restart did not move the robot" looks like.
     pub torque: Option<bool>,
     /// How many times torque was written, so a test can tell "brought up once" from "written every
     /// tick" — the latter being a bus transaction per joint per tick.
     pub torque_writes: usize,
+    /// Every servo id rebooted, in order.
+    pub reboots: Vec<u8>,
+    /// What [`RobotIo::census`] reports. `None`, the default, is a backend with nothing to ping.
+    pub census: Option<Census>,
+    /// How many times [`RobotIo::census`] was asked, so a test can tell "asked about a run of
+    /// failures" from "asked every tick".
+    pub censuses: usize,
+    /// What [`RobotIo::servo_identity`] reports. `None`, the default, is a backend with no servos.
+    pub identity: Option<[ServoIdentity; NUM_JOINTS]>,
+    /// What [`RobotIo::impact_guard`] reports. `None`, the default, is a backend with no servos.
+    pub impact_guard: Option<[u8; NUM_JOINTS]>,
+    /// How many times [`RobotIo::impact_guard`] was asked: it is a bus transaction, and a test
+    /// has to be able to tell "while someone records" from "every tick".
+    pub impact_guard_reads: usize,
 }
 
 impl Default for FakeIo {
@@ -227,8 +348,17 @@ impl FakeIo {
                 temps_c: [32.0; NUM_JOINTS],
             }),
             track_targets: true,
+            write_arms: false,
+            velocity_stated: false,
+            load_stated: false,
             torque: None,
             torque_writes: 0,
+            reboots: Vec::new(),
+            census: None,
+            censuses: 0,
+            identity: None,
+            impact_guard: None,
+            impact_guard_reads: 0,
         }
     }
 
@@ -246,6 +376,12 @@ impl FakeIo {
         self
     }
 
+    /// Model a servo that enables torque as a side effect of position writes.
+    pub fn arming_writes(mut self) -> Self {
+        self.write_arms = true;
+        self
+    }
+
     /// Fail the next `n` reads, then behave normally. Models a board that comes up before
     /// its servo power does.
     pub fn failing_reads(mut self, n: u32) -> Self {
@@ -257,12 +393,33 @@ impl FakeIo {
         self.sensors.imu = imu;
     }
 
+    /// Joint velocities the next [`RobotIo::read`] will report.
+    ///
+    /// Unlike positions these are never derived from what was written — a fake that echoed
+    /// its own targets back as velocity would make any test of the velocity path pass
+    /// vacuously.
+    pub fn set_velocities(&mut self, velocities: [f64; NUM_JOINTS]) {
+        self.sensors.velocities = velocities;
+        self.velocity_stated = true;
+    }
+
+    /// Present current per joint, mA. Same rule as [`Self::set_velocities`]: nothing derives
+    /// this, so a test has to state what the servos are supposed to be reporting.
+    pub fn set_currents_ma(&mut self, currents_ma: [f64; NUM_JOINTS]) {
+        self.sensors.currents_ma = currents_ma;
+        self.load_stated = true;
+    }
+
     pub fn positions(&self) -> [f64; NUM_JOINTS] {
         self.sensors.positions
     }
 }
 
 impl RobotIo for FakeIo {
+    fn position_write_arms(&self) -> bool {
+        self.write_arms
+    }
+
     fn read(&mut self) -> Result<Sensors> {
         if self.fail_next_read {
             self.fail_next_read = false;
@@ -278,6 +435,9 @@ impl RobotIo for FakeIo {
 
     fn write(&mut self, targets: &JointTargets) -> Result<()> {
         self.writes += 1;
+        if self.write_arms {
+            self.torque = Some(true);
+        }
         self.last_written = Some(*targets);
         if self.track_targets {
             self.sensors.positions = targets.positions;
@@ -296,8 +456,35 @@ impl RobotIo for FakeIo {
         Ok(())
     }
 
+    fn reboot(&mut self, id: u8) -> Result<()> {
+        self.reboots.push(id);
+        Ok(())
+    }
+
+    fn measures_velocity(&self) -> bool {
+        self.velocity_stated
+    }
+
+    fn measures_load(&self) -> bool {
+        self.load_stated
+    }
+
     fn slow_sensors(&mut self) -> Result<SlowSensors> {
         self.slow.ok_or(IoError::Simulated)
+    }
+
+    fn census(&mut self) -> Result<Option<Census>> {
+        self.censuses += 1;
+        Ok(self.census.clone())
+    }
+
+    fn servo_identity(&mut self) -> Result<Option<[ServoIdentity; NUM_JOINTS]>> {
+        Ok(self.identity)
+    }
+
+    fn impact_guard(&mut self) -> Result<Option<[u8; NUM_JOINTS]>> {
+        self.impact_guard_reads += 1;
+        Ok(self.impact_guard)
     }
 }
 

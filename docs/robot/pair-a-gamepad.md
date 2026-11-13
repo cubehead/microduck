@@ -1,7 +1,8 @@
 # Pair a gamepad
 
 Once per pad. After this, `padd.service` drives whatever pad is connected, from boot — nothing to
-start, and nothing that dies with your ssh session.
+start, and nothing that dies with your ssh session. A pad on another machine on the LAN can drive the robot
+over UDP instead — [`udp-pad.md`](udp-pad.md).
 
 ## Xbox BLE controller driver
 
@@ -31,6 +32,12 @@ On an **Xbox** controller this is two presses, and the second is the one that go
    **flashes quickly**. Slow blinking means it is on but not pairing.
 
 On a **DualSense**: hold Create and PS together until the light bar flashes.
+
+On a **Pro Controller** — the no-name Switch-style pads, which bluetoothctl lists as
+`Pro Controller` — hold the small **Sync** button on the top edge, next to the USB-C port, until the
+player lights sweep back and forth. It is a classic Bluetooth (BR/EDR) pad, the Xbox one is LE, and
+the robot pairs the two in opposite orders; `pad pair` picks the right one by itself, and
+[pairing one by hand](#pairing-a-pro-controller-by-hand) says what the order is if you have to.
 
 ## Pair it
 
@@ -124,6 +131,59 @@ Do not run `bluetoothctl scan` while the pad is connected, and do not hold `cat`
 `event` node to watch it. On this radio a scan drops the link. The `event` index also moves each
 time the controller is removed and created again.
 
+**Nor does a pad paired here before.** Put it in pairing mode and run `pad pair`: the robot drops
+its old bond and pairs it again, so there is no `pad forget` or `bluetoothctl remove` to run first.
+
+### With an NFC tag
+
+On a robot with an NFC reader — the beta board's own, or a CLRC663 board on USB (`/dev/ttyACM0`)
+on a prototype — a pairing tag does what `robotctl pad pair` does with nothing typed: put the pad in
+pairing mode, touch the tag to the reader. The robot quacks when it has read the tag, and greets — a different sound,
+often a double "wak-wak" — once the pad is paired; a refusal gets no second sound. `nfcd.service` is
+always running and picks a reader up within thirty seconds of it being plugged in.
+
+- **A pad already connected wins.** If one is driving, a touch does nothing, so a tag brushed against
+  the robot never hands the bond to someone else's pad.
+- **One attempt per touch.** If it did not pair, lift the tag and touch again.
+- **Every pairing tag is the same.** It holds one text (or URI) record reading exactly
+  `microduck_gamepad_pairing`, and names no pad: the robot takes the one in pairing mode, and refuses
+  if it finds two, as `robotctl pad pair` does. The robot writes one itself — see
+  [writing a tag](#writing-a-tag) — and so does a phone. A tag with an address on it, as the first
+  ones had, no longer pairs anything.
+- It is an **NTAG** (NFC Forum Type 2, ISO 14443A), or on the beta board's reader also an **ISO
+  15693 tag** (NFC Forum Type 5: ICODE SLIX, ST25TV). Any NFC phone writes either — NFC Tools,
+  *Write* → *Add a record* → *Text*. A Type 5 tag that is not NDEF-formatted yet needs its maker's
+  app first (NXP TagWriter, ST25 NFC Tap) — or write it with the robot, below, which formats it. The USB reader reads NTAGs only.
+
+What it did is in `journalctl -u nfcd -b`.
+
+#### Writing a tag
+
+The robot's own reader writes tags. On the robot, or from a laptop over Bluetooth:
+
+```bash
+robotctl nfc-flash microduck_gamepad_pairing
+duckctl nfc-flash microduck_gamepad_pairing
+```
+
+The robot asks for a tag with the sound it makes when it loses its pad, the questioning quack;
+touch a tag to the head within 20 seconds (`--timeout` changes that, up to 120). A tag already on
+the reader is written too. The robot quacks when the tag took, and the command says so
+once it has read it back; the tag then holds that one text record, exactly as a phone app writes
+it. While a write is waiting, a touched tag is written rather than acted on, and the tag just
+written is not then read as a touch — writing a pairing tag does not pair.
+
+An **NTAG** is written, and on the beta board's reader an **ISO 15693 tag** too. A blank ISO 15693
+tag is formatted for NDEF as it is written, so one no phone app recognises still works. A MIFARE
+Classic, a tag locked read-only or a text longer than the tag holds is refused with why, and
+nothing on it changes. Nothing but the message area and, on a blank ISO 15693 tag, its capability
+container is written — never the UID, the lock bytes or the configuration pages — so a write
+cannot lock a tag.
+A tag lifted half way through reads as no NDEF; write it again.
+
+It is `nfc.write` on `nfcd`'s socket, `/run/nfcd/nfc.sock`, so a robot whose `nfcd` predates it has
+nothing listening there: update the daemon.
+
 ## Check it
 
 ```bash
@@ -137,6 +197,21 @@ padd    active — driving whatever pad connects
 
 Two lines, because they fail separately: a connected pad with a dead driver looks exactly like a
 working robot ignoring you.
+
+A Pro Controller also carries a six-axis IMU, which the kernel exposes as a second input device
+beside the one that drives. `robotctl monitor`, with `p` for the pad block, shows it as a panel
+that appears only when the pad has one: a wireframe pad posed like the real one, pitch and roll
+from gravity, yaw from the gyro alone (it drifts — nothing on a pad observes heading), and the
+gyro's rest bias, which the clone needs learned before the picture stops turning on its own. Set
+the pad down for half a second and the panel says `settled`. The stream costs nothing while the
+monitor is not open: `padd` reads the IMU node only while somebody is subscribed to the tap — or
+while it is steering the head from it, below.
+
+The same attitude can drive the robot's head. `sudo robotctl configure`, section *Controller-IMU
+head control*, `enabled`: head + move mode (D-pad right) then hands the head to the pad's tilt
+while the sticks keep driving, and pressing D-pad right again re-centres on the pad's current
+attitude — the [cheat sheet](cheatsheet.md#gamepad-configd) has the whole mapping. The picture
+in the monitor and the head use one filter, so where the drawn pad points is where the head goes.
 
 `paired but NOT trusted` is the state worth knowing. It works now and does not reconnect after a
 reboot, because approving a reconnection needs an agent and at boot there is none. Re-run `pad pair`
@@ -314,6 +389,44 @@ to check and how to drop it.
 Both are workarounds for the aic8800 radio, not properties of the design. They go when the radio
 does.
 
+### A classic pad and bluetoothd's CPU
+
+A Pro Controller streams IMU samples in every packet, about 200 packets a second, whether or not
+anyone touches it. With BlueZ's default `UserspaceHID=true` each one is relayed by bluetoothd through
+uhid, and that cost 16% of a core on graphite with the pad idle. `scripts/setup-board.sh` sets
+`UserspaceHID=false` in `/etc/bluetooth/input.conf` on every board, which hands the channel to the
+kernel's `hidp` and takes bluetoothd out of the data path — measured 0.0% afterwards, same driver,
+same input nodes, same bond. It applies at the next boot. An LE pad such as the Xbox is untouched by
+the setting: HID over GATT never went through `input.conf`. A board provisioned before this exists
+gets it by re-running the script:
+
+```bash
+sudo sh scripts/setup-board.sh && sudo reboot
+```
+
+## Pairing a Pro Controller by hand
+
+Only if `pad pair` is not available. The order matters and is the **reverse** of the Xbox one:
+
+```bash
+bluetoothctl pair 98:B6:E9:28:06:09
+```
+
+```bash
+bluetoothctl connect 98:B6:E9:28:06:09
+```
+
+```bash
+bluetoothctl trust 98:B6:E9:28:06:09
+```
+
+`connect` first — which bonds as a side effect — ends in the state that is hardest to read: the pad's
+light goes solid, `pad status` says `connected`, `bluetoothctl info` says `Paired: yes` and
+`Connected: yes`, and **no input device exists**, so `padd` sits at "waiting for padd to open a pad"
+and nothing drives. Recover with `sudo robotctl pad forget <address>`, put the pad back into pairing
+mode and pair again. Running `pad pair` never produces this state: it knows the pad is classic from
+the class BlueZ reports and pairs before it connects.
+
 ## When pairing fails every time
 
 Check `/etc/bluetooth/main.conf` for the `Privacy` setting. It should read `Privacy = device`.
@@ -381,7 +494,7 @@ Then, for a verdict over a window rather than a live picture, copy the measureme
 from a clone of this repo:
 
 ```bash
-scp scripts/pad-link-test.sh radxa@<board>:/tmp/
+scp scripts/pad-link-test.sh microduck@<board>:/tmp/
 ```
 
 What has already happened, out of `padd`'s journal — no pad needed, and it answers immediately:
@@ -417,7 +530,7 @@ pad firmware — and none of that is visible in `pad status`.
 Copy the report onto each board, from a clone of this repo:
 
 ```bash
-scp scripts/pad-stack-report.sh radxa@<board>:/tmp/
+scp scripts/pad-stack-report.sh microduck@<board>:/tmp/
 ```
 
 ```bash
@@ -433,11 +546,11 @@ it.
 To compare two boards, ask each for only the values that have to match:
 
 ```bash
-ssh radxa@<board-a> sudo sh /tmp/pad-stack-report.sh --fingerprint > /tmp/a.fp
+ssh microduck@<board-a> sudo sh /tmp/pad-stack-report.sh --fingerprint > /tmp/a.fp
 ```
 
 ```bash
-ssh radxa@<board-b> sudo sh /tmp/pad-stack-report.sh --fingerprint > /tmp/b.fp
+ssh microduck@<board-b> sudo sh /tmp/pad-stack-report.sh --fingerprint > /tmp/b.fp
 ```
 
 ```bash

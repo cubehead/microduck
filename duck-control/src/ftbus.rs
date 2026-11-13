@@ -1275,9 +1275,9 @@ impl FeetechIo {
     /// [`TICK_STATUS_LEN`] before this attempt is declared failed.
     fn read_once(&mut self) -> Result<Sensors> {
         self.capture.start();
-        let result =
-            self.controller
-                .sync_read_raw_data(&self.ids, TICK_READ_ADDR, TICK_READ_LEN);
+        let result = self
+            .controller
+            .sync_read_raw_data(&self.ids, TICK_READ_ADDR, TICK_READ_LEN);
         self.capture.stop();
         match result {
             Ok(blocks) => self.decode_tick_blocks(&blocks),
@@ -1351,6 +1351,12 @@ impl FeetechIo {
 }
 
 impl RobotIo for FeetechIo {
+    fn reboot(&mut self, _id: u8) -> Result<()> {
+        Err(IoError::Bus(
+            "servo reboot is not supported by the Feetech backend".into(),
+        ))
+    }
+
     /// One bus read, retried once.
     ///
     /// See [`READ_ATTEMPTS`]. A failed attempt first tries to rebuild the tick from the

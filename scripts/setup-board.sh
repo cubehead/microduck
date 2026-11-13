@@ -48,6 +48,10 @@ CMDLINE="${CMDLINE:-/proc/cmdline}"
 
 BT_CONF=/etc/bluetooth/main.conf
 
+# BlueZ's input profile settings. One line in it decides who carries a classic (BR/EDR) gamepad's
+# reports — see `configure_classic_hid`. Every board gets that change; no flag.
+BT_INPUT_CONF=/etc/bluetooth/input.conf
+
 # Does this board need `Privacy = device`? `--weird-ble` on provision-board.sh.
 #
 # Off by default: some Zero 3W units bond a pad under BlueZ's own default and want nothing from
@@ -882,6 +886,85 @@ configure_bluetooth() {
     write_pause_marker
 }
 
+# A classic (BR/EDR) gamepad's reports go through the kernel, not through bluetoothd.
+#
+# BlueZ 5.82 defaults `UserspaceHID=true`: bluetoothd reads every HID report from the L2CAP socket
+# and re-injects it into the kernel through uhid. For an LE pad (Xbox) this setting is irrelevant —
+# HID over GATT is bluetoothd's own profile either way, and the Xbox sends nothing while idle. For a
+# classic pad it is the whole data path, and the no-name "Pro Controller" Switch clones stream IMU
+# samples in every packet at ~200 packets/s whether or not anyone touches them. Measured on graphite,
+# 2026-09-09, pad connected and untouched:
+#
+#   UserspaceHID=true   bluetoothd 15.8 % CPU, ~594 IMU reports/s on /dev/input/event5, nodes under
+#                       /sys/devices/virtual/misc/uhid/
+#   UserspaceHID=false  bluetoothd  0.0 %, same reports, nodes under .../hci0/hci0:128/ — the
+#                       kernel's hidp owns the channel and hid-nintendo binds exactly as before
+#
+# The bond, the reconnect after a reboot and `padd` driving from the pad were all unchanged by the
+# switch; the pad reconnected by itself on the first boot with the new value. No flag, because there
+# is no board on which the userspace path is the better one: it costs a core's worth of context
+# switches and buys nothing this robot uses.
+#
+# Applies at the next bluetoothd start, which on this board means a reboot — see the note on
+# `needs_reboot` above `configure_bluetooth`.
+configure_classic_hid() {
+    if [ ! -f "$BT_INPUT_CONF" ]; then
+        say "no ${BT_INPUT_CONF}; writing one with UserspaceHID=false"
+        printf '[General]\nUserspaceHID=false\n' > "$BT_INPUT_CONF"
+        needs_reboot=1
+        return 0
+    fi
+    if grep -Eq '^[[:space:]]*UserspaceHID[[:space:]]*=[[:space:]]*false' "$BT_INPUT_CONF"; then
+        say "bluetooth UserspaceHID already false (classic pads go through the kernel)"
+        return 0
+    fi
+    say "setting UserspaceHID=false in ${BT_INPUT_CONF} (classic pads through the kernel, not bluetoothd)"
+    if grep -Eq '^[[:space:]]*#?[[:space:]]*UserspaceHID[[:space:]]*=' "$BT_INPUT_CONF"; then
+        sed -i -E 's|^[[:space:]]*#?[[:space:]]*UserspaceHID[[:space:]]*=.*|UserspaceHID=false|' "$BT_INPUT_CONF"
+    elif grep -q '^\[General\]' "$BT_INPUT_CONF"; then
+        sed -i '/^\[General\]/a UserspaceHID=false' "$BT_INPUT_CONF"
+    else
+        printf '\n[General]\nUserspaceHID=false\n' >> "$BT_INPUT_CONF"
+    fi
+    needs_reboot=1
+}
+
+# A phone that forgot the robot can pair with it again.
+#
+# `btd` requires an encrypted link, so a phone bonds with the robot. When the owner then forgets the
+# robot in the phone's Bluetooth settings — the usual first move with any Bluetooth trouble — the
+# phone drops its keys and the robot keeps its own. On the next connect the phone starts a fresh
+# just-works pairing, and BlueZ's default `JustWorksRepairing = never` refuses to replace an existing
+# bond that way: the link fails with `PIN or Key Missing (0x06)` and the phone never reaches the RPC
+# characteristic. Only removing the bond on the robot, over ssh, recovered it.
+#
+# `always` loses nothing: the bond is encryption, never identity — the PIN or the secure-mode key is
+# what authenticates a phone (`app-path-design.md` §5.2). `confirm` would only route the same yes
+# through `btd`'s agent. Measured on a face-board-v1 beta with an iPhone, 2026-11-09: refused twice
+# under `never`; under `always`, forget-then-reconnect paired with no robot-side step.
+#
+# Every board, no flag. Applies at the next bluetoothd start, which on this board means a reboot —
+# see the note on `needs_reboot` above `configure_bluetooth`.
+configure_phone_repairing() {
+    if [ ! -f "$BT_CONF" ]; then
+        warn "no ${BT_CONF}; a phone that forgets this robot will not pair again until its bond is removed here"
+        return 0
+    fi
+    if grep -Eq '^[[:space:]]*JustWorksRepairing[[:space:]]*=[[:space:]]*always' "$BT_CONF"; then
+        say "bluetooth JustWorksRepairing already always (a phone can re-pair after forgetting)"
+        return 0
+    fi
+    say "setting JustWorksRepairing = always in ${BT_CONF} (a phone can re-pair after forgetting)"
+    if grep -Eq '^[[:space:]]*#?[[:space:]]*JustWorksRepairing[[:space:]]*=' "$BT_CONF"; then
+        sed -i -E 's|^[[:space:]]*#?[[:space:]]*JustWorksRepairing[[:space:]]*=.*|JustWorksRepairing = always|' "$BT_CONF"
+    elif grep -q '^\[General\]' "$BT_CONF"; then
+        sed -i '/^\[General\]/a JustWorksRepairing = always' "$BT_CONF"
+    else
+        printf '\n[General]\nJustWorksRepairing = always\n' >> "$BT_CONF"
+    fi
+    needs_reboot=1
+}
+
 # The marker `robotctl` reads to decide whether to pause `btd` for a pairing.
 #
 # Its own function because both flags write it and only one of them touches `Privacy` — which is the
@@ -1240,6 +1323,8 @@ main() {
     check_network
     free_motor_port
     configure_bluetooth
+    configure_phone_repairing
+    configure_classic_hid
     configure_audio
     configure_xpadneo
     configure_tof

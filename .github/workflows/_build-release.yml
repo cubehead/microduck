@@ -138,10 +138,14 @@ jobs:
           # reads as a broken daemon rather than an incomplete artifact.
           cp target/aarch64-unknown-linux-gnu/release/configd staged/
           cp target/aarch64-unknown-linux-gnu/release/btd staged/
+          cp target/aarch64-unknown-linux-gnu/release/duck-gateway staged/
           # padd is the gamepad intent client. Shipped because a dev board is where
           # anyone drives the robot from, and the intent API only stays honest if the
           # thing exercising it daily is actually on the robot.
           cp target/aarch64-unknown-linux-gnu/release/padd staged/
+          # netpadd is the same intent client fed by UDP instead of Bluetooth. Its unit is enabled
+          # beside padd's and an ExecCondition on `[netpad] enabled` picks which of the two runs.
+          cp target/aarch64-unknown-linux-gnu/release/netpadd staged/
           # mediad is the WebRTC gateway. Its unit carries an [Install] section, so postinstall
           # enables it and an update restarts it like any other daemon
           # (docs/design/restart-order.md §1). It was once shipped inert, and this comment
@@ -155,6 +159,8 @@ jobs:
           # The head ToF daemon. Its unit is packaged below; a board with no sensor
           # fitted runs it anyway and says so, which is cheaper than a special case.
           cp target/aarch64-unknown-linux-gnu/release/tofd staged/
+          # The NFC reader daemon, the same way: a board with no reader runs it, and it says so.
+          cp target/aarch64-unknown-linux-gnu/release/nfcd staged/
 
           cargo run -p xtask -- package \
             --version "${{ inputs.version }}" \
@@ -168,40 +174,39 @@ jobs:
             --include "robotd/systemd/robotd.service=systemd/robotd.service" \
             --include "hooks/postinstall=hooks/postinstall" \
             --include "scripts/setup-gstreamer.sh=scripts/setup-gstreamer.sh" \
-            --include "duck-detect/models/duck_detect.rknn=models/duck_detect.rknn" \
-            --include "duck-detect/models/duck_detect.onnx=models/duck_detect.onnx" \
             --include "scripts/setup-npu.sh=scripts/setup-npu.sh" \
             --include "deploy/overlays/rk3568-npu-enable.dts=deploy/overlays/rk3568-npu-enable.dts" \
             --include "scripts/setup-rkaiq.sh=scripts/setup-rkaiq.sh" \
             --include "scripts/rkaiq-modinfo-shim.c=scripts/rkaiq-modinfo-shim.c" \
             --include "scripts/setup-login.sh=scripts/setup-login.sh" \
+            --include "scripts/setup-quiet-boot.sh=scripts/setup-quiet-boot.sh" \
+            --include "scripts/seed-policies.sh=scripts/seed-policies.sh" \
+            --include "scripts/seed-detector.sh=scripts/seed-detector.sh" \
             --include "scripts/robot-rescue=scripts/robot-rescue" \
             --include "scripts/robot-boot-check=scripts/robot-boot-check" \
             --include "updater/systemd/robot-boot-check.service=systemd/robot-boot-check.service" \
             --include "updater/systemd/robot-boot-check.timer=systemd/robot-boot-check.timer" \
             --include "configd/systemd/configd.service=systemd/configd.service" \
             --include "btd/systemd/btd.service=systemd/btd.service" \
+            --include "duck-gateway/systemd/duck-gateway.service=systemd/duck-gateway.service" \
             --include "btd/systemd/sysusers.d/btd.conf=systemd/sysusers.d/btd.conf" \
             --include "padd/systemd/padd.service=systemd/padd.service" \
             --include "padd/systemd/sysusers.d/padd.conf=systemd/sysusers.d/padd.conf" \
+            --include "netpadd/systemd/netpadd.service=systemd/netpadd.service" \
+            --include "netpadd/systemd/sysusers.d/netpadd.conf=systemd/sysusers.d/netpadd.conf" \
             --include "mediad/systemd/mediad.service=systemd/mediad.service" \
             --include "mediad/systemd/sysusers.d/mediad.conf=systemd/sysusers.d/mediad.conf" \
             --include "tof/systemd/tofd.service=systemd/tofd.service" \
             --include "tof/systemd/sysusers.d/tofd.conf=systemd/sysusers.d/tofd.conf" \
+            --include "nfc/systemd/nfcd.service=systemd/nfcd.service" \
+            --include "nfc/systemd/sysusers.d/nfcd.conf=systemd/sysusers.d/nfcd.conf" \
             --include "deploy/journald.conf.d/10-robot.conf=deploy/journald.conf.d/10-robot.conf" \
             --include "docs/design/architecture.md=docs/architecture.md" \
             --include "docs/design/updater-design.md=docs/updater-design.md" \
             --include "deploy/README.md=docs/deploy.md" \
-            --include "policies/alpha_walking.onnx=policies/alpha_walking.onnx" \
-            --include "policies/alpha_stand.onnx=policies/alpha_stand.onnx" \
-            --include "policies/alpha_sitstand.onnx=policies/alpha_sitstand.onnx" \
-            --include "policies/alpha_ground_pick.onnx=policies/alpha_ground_pick.onnx" \
-            --include "policies/ball_kick_left.onnx=policies/ball_kick_left.onnx" \
-            --include "policies/ball_kick_right.onnx=policies/ball_kick_right.onnx" \
-            --include "policies/roller.onnx=policies/roller.onnx" \
-            --include "policies/roller_crouch.onnx=policies/roller_crouch.onnx" \
-            --include "policies/roulade.onnx=policies/roulade.onnx" \
-            --include "pet-detect/models/pet_detect.onnx=models/pet_detect.onnx"
+            --include "pet-detect/models/pet_detect.onnx=models/pet_detect.onnx" \
+            --include "duck-control/models/pickup_detector.onnx=models/pickup_detector.onnx" \
+            --include "robotd/emotions=emotions"
 
 
           # The bootstrap binary, published bare alongside the artifact.

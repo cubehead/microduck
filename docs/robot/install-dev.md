@@ -7,10 +7,9 @@ customer robot is set up differently and deliberately refuses those builds — e
 assumes a dev board, never a customer robot.
 
 Nothing is relaxed for a dev build: same signature and hash verification, same health gate, same
-auto-rollback. The only difference is which key signed it, and that is what keeps these builds
-off customer robots — they refuse a dev key twice over. `allow_dev_keys = false`, and a trusted
-key only counts as a dev key if its filename ends `.dev.pub`. Both halves of the setup below
-exist to flip exactly that.
+rollback setting. The only difference is which key signed it, and that is what keeps these builds
+off customer robots — every `updaterd` carries the dev key, and uses it only on a robot that has
+been made a dev board ([below](#making-an-existing-board-take-dev-builds)).
 
 ## Flash the board
 
@@ -24,7 +23,7 @@ first boot and is reachable over ssh straight away.
 Then add your ssh key, so provisioning can reconnect after it reboots the board:
 
 ```bash
-ssh-copy-id radxa@192.168.1.42
+ssh-copy-id microduck@192.168.1.42
 ```
 
 ## What you need
@@ -50,7 +49,7 @@ export DUCK_TOKEN=github_pat_replace_with_your_token
 ```
 
 ```bash
-./scripts/provision-board.sh --pause-btd-on-pair --name <MY_COOL_ROBOT_NAME> radxa@192.168.1.42
+./scripts/provision-board.sh --pause-btd-on-pair --name <MY_COOL_ROBOT_NAME> microduck@192.168.1.42
 ```
 
 That sends your dev key, starts provisioning, waits out the reboot, streams the log, and ends on
@@ -113,7 +112,7 @@ resumes at boot, so the board finishes whether or not you are still watching. Ct
 nothing, and you can pick the log back up:
 
 ```bash
-ssh -t radxa@192.168.1.42 'sudo tail -f /var/lib/robot/provision.log'
+ssh -t microduck@192.168.1.42 'sudo tail -f /var/lib/robot/provision.log'
 ```
 
 `--ref BRANCH` provisions from a branch: its scripts run the bring-up, and its build of the daemon
@@ -124,7 +123,8 @@ branch.
 Provisioning **fails** if that build cannot be installed, or if it is installed and then rolled back
 by the health gate. A dev board quietly running the stable release when a branch was asked for is the
 worst failure to debug: everything looks installed and the code under test is not there. Give CI its
-minute or two before provisioning, and check with `gh run list --branch BRANCH` if it stops.
+minute or two before provisioning, and check with `gh run list --branch BRANCH` if it stops. `--name`
+is applied before the branch build, so a board that fails here still has its name.
 
 Other useful flags: `--name Ducky` names the robot instead of leaving it the `duck-7f3a` it derives
 from its own serial (`robotctl system set-name` changes it later, so this only saves a command),
@@ -161,7 +161,7 @@ different one. `StrictHostKeyChecking=accept-new` does not cover it: the host is
 is. The raw ssh error for this is a wall of text about a possible attack.
 
 ```bash
-./scripts/provision-board.sh radxa@192.168.1.42 --forget-host-key
+./scripts/provision-board.sh microduck@192.168.1.42 --forget-host-key
 ```
 
 This matters more than it sounds, because DHCP leases get reused — the address that was one
@@ -190,33 +190,31 @@ Three things stop it working, and it says which:
 
 ## Making an existing board take dev builds
 
-For a board provisioned some other way, or one set up before you had the key. Both halves are
-needed: either alone leaves a board that still refuses branch builds.
-
-The easy way is to re-run the installer with the key, which validates it and flips the flag in
-one step:
+For a board flashed with an image, provisioned some other way, or set up with `--no-dev-key`. On
+the board:
 
 ```bash
-sudo DUCK_TOKEN="$DUCK_TOKEN" DUCK_DEV_KEY=/tmp/team.dev.pub sh /tmp/install.sh
+sudo robotctl configure --allow-dev-daemon on
 ```
 
-It installs the key as `team.dev.pub` whatever the source file was called. That name matters: the
-`.dev.` infix is what classifies a key as a dev key, and a key landing under any other name is
-trusted as a **release** key.
-
-By hand, if you would rather see each step:
+That is the whole step. `updaterd` carries the team dev key built in, so there is no key to copy,
+and this switch — kept under `/var/lib/robot`, so an OS update does not undo it — tells it to use
+that key. It restarts `updaterd`. Then:
 
 ```bash
-sudo cp team.dev.pub /etc/robot/trusted_keys/team.dev.pub
+sudo robotctl update apply --ref main daemon
 ```
 
-```bash
-sudo sed -i 's/^allow_dev_keys.*/allow_dev_keys        = true/' /etc/robot/updater.toml
-```
+Swap `main` for any branch to get what CI last built for it. From here on, don't run
+`robotctl update apply daemon` without `--ref` or `--version`: it installs the latest stable
+release, which on a dev board is usually a downgrade.
 
-```bash
-sudo systemctl restart updaterd
-```
+`sudo robotctl configure --allow-dev-daemon off` makes it a robot that only takes releases again.
+The same switch is the first row of the `sudo robotctl configure` editor, `allow_dev_daemon` under
+`[dev board]`: SPACE toggles it, and saving offers the `updaterd` restart.
+
+The switch needs an `updaterd` that knows about it — a release from after it was added. On a board
+running an older one, `sudo robotctl update apply daemon` first, then the switch.
 
 ## The token, by hand
 
@@ -262,7 +260,7 @@ with no token can still install from a local directory or a dev push.
 ## Installing without a network
 
 On a board that already has a release, install a local directory the ordinary way — through the
-daemon, with the health gate and auto-rollback:
+daemon, with the health gate:
 
 ```bash
 sudo robotctl update apply daemon --from /media/usb/release

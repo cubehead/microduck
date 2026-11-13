@@ -96,18 +96,18 @@ The servo UART is still **`robotd`'s only serial port** — one owner, `TIOCEXCL
 adds an I²C device the loop also reads; MicroDuck does not. ID 200 is a joint on neither
 robot (`JOINT_IDS` never contains it).
 
-**One owner at a time, and nothing hard-enforces it.** `serialport` sets `TIOCEXCL`, which
+**One owner at a time; tty exclusivity alone does not enforce it.** `serialport` sets `TIOCEXCL`, which
 turns a second *unprivileged* open into `EBUSY` — but `robotd.service` runs as root, because
-motor control needs the character devices, and root is not stopped by that flag. So the
-exclusion is arranged rather than enforced, and each other claimant is kept off the port
-deliberately:
+motor control needs the character devices, and root is not stopped by that flag. The daemon
+and standalone `init` therefore share an advisory lock, and other claimants are kept off the
+port separately:
 
 - **The control loop** owns it for as long as the daemon runs.
-- **`robotd init`** opens the port itself, and as root it will succeed *while the daemon is
-  running* — two writers interleaving packets on one bus, which reads as a hardware fault. So
-  it wants the daemon stopped, and that is exactly why `robot.init` and `robot.relax` exist as
-  IPC methods (§3.3): the daemon serves both from inside the loop, so nothing else has to open
-  the bus at all. `init` is the escape hatch for a robot whose daemon is not running.
+- **`robotd init`** opens the port itself, but must first take the daemon's endpoint lock.
+  It holds that lock through the entire ramp: a running daemon refuses `init`, and an `init`
+  already moving the robot refuses a daemon startup or another `init`. `robot.init` and
+  `robot.relax` remain the IPC methods (§3.3) for a running daemon; standalone `init` is the
+  escape hatch for a robot whose daemon is not running.
 - **`serial-getty@ttyS2`** — Armbian runs a login console on UART2 by default, and an `agetty`
   holding the port makes every servo invisible to everything else. `scripts/setup-board.sh`
   masks the unit; `fuser -v /dev/ttyS2` naming `agetty` is how that was found, and it is still
@@ -115,11 +115,28 @@ deliberately:
 - **The runtime**, at a coarser grain: it drives the same bus, so a board runs the runtime or
   `robotd` and never both, and the units say so with `Conflicts=` (§5.2).
 
+**Socket ownership.** Both entry points acquire `<socket>.lock` (normally
+`/run/robotd.sock.lock`) before publishing `/run/robotd/identity.json` or opening the bus.
+The daemon also binds its listener before starting the control thread, and keeps the lock
+through control-thread shutdown and socket cleanup. A refused duplicate must not overwrite
+the owner's PID and build: `robotctl health` and updater startup checks read that identity.
+For a listener left by an older daemon without a lock, the daemon's bind path removes only
+an actual socket that refuses a bounded connection probe; live listeners and ambiguous paths
+are preserved. Standalone `init` only locks and never binds or cleans up the socket.
+
+**Never unlink the lock file, even at shutdown.** The kernel releases the advisory lock when
+its file is closed or the process exits, including `SIGKILL`; the file itself stays in place.
+Deleting and recreating it could leave contenders locking two different inodes under the same
+name. File existence does not mean the lock is held. The lock is per `--socket`, so callers
+using the same physical bus must use the same socket setting; separate endpoints remain useful
+for independent fake daemons. Older binaries and other tools do not participate in this lock
+and must still be stopped before standalone `init` takes over the bus.
+
 ### 1.2 Who talks to `robotd`
 
 ```text
    ┌──────────┐   robot.move / robot.head      ┌─────────────────────┐
-   │  padd    │───(notifications, 50 Hz)──────►│                     │
+   │  padd    │──(notifications, ≤50 Hz)──────►│                     │
    │ gamepad  │   robot.stop / robot.enable    │                     │
    └──────────┘───(requests, answered)────────►│                     │
                                                │   /run/robotd.sock  │
@@ -196,6 +213,8 @@ write()         OpenMicroDuck: one sync_write WritePosEx (0x29 × 7 B)
 publish         atomics always; a state frame only if someone subscribed     (§4.1)
 
 every 1 s       slow_sensors() · volts/temps (HD1910: tick cache; XL330: extra read)
+
+XL330 can use upstream fast sync read; its impact-guard telemetry is XL330-specific.
 ```
 
 Where the data goes, once per period:
@@ -394,6 +413,29 @@ what teaches everyone to ignore the message; past the threshold it is rate-limit
 gated. `robotd --fake` is the laptop path, and it must be asked for explicitly rather than
 fallen back to.
 
+**The impact guard's state is a fourth read, and only while someone records.** ROBOTIS's impact
+guard firmwares (`firmware_version` 3, 4) brake a servo that hits something and hold it softly,
+which is what keeps gear teeth whole; their register 66 says which of armed, braking or holding each
+servo is in. That is a transaction of its own (~1 ms), so it is read only on ticks with a
+`robot.state` subscriber, after the goal positions are written — the read→decide→write path is the
+same with or without it — and only from a robot where at least one servo runs that firmware. The
+firmware is read once a start with the vet book's identity read, and every servo on another one is
+named in the journal and published as `null`. The guard's own settings are EEPROM on that firmware
+(40–43 and 56–59), asserted by the same startup check as the registers above. `bus.impact_guard`
+is off by default, until it is understood why the stress test robot on it fell on its own far more
+often than any other (2026-11-09); on, it writes the six `bus.impact_guard_*` settings, by default
+what a microduck walks with (a short brake on fast
+arrivals, no hold, a stronger speed taper: ROBOTIS's factory values made a walking robot fall), or
+with `bus.impact_guard = false` a deceleration no impact reaches, a hold current the motor never
+draws and no speed taper — the factory firmware with only Current Limit. V4 adds Impact Guard
+Enable (67, RAM), off after every power-up and with it the whole guard, and off there writes no
+settings: the switch does it, so the toggle cannot leave stale settings behind. The torque-on write
+sets it to what `bus.impact_guard` asks first; that one moment follows every way a servo can lose
+RAM (power-up, reboot, a latched error), each of which leaves it limp, and a servo still stiff after
+a `robotd` restart takes the write too. New settings are written with torque off and run from the
+next torque on, without a reboot: on V3, each restart's hold current and taper showed in the very
+next walk on lavandiere (2026-11-05); on V4, the gear bench's first shot after the write ran them.
+
 Voltage is averaged across the servos: all fifteen sit on one pack, so a single reading is the
 same measurement with more noise, and a device answering zero is filtered out rather than
 averaged in as if the pack were half flat. Temperature is *not* averaged — the caller gets
@@ -404,6 +446,35 @@ shutdown.
 A silent servo does not produce a short answer: `rustypot`'s `sync_read` waits for every id and
 fails the whole transaction if one does not reply. So both reads are all-or-nothing, and the
 caller keeps its previous sample rather than treating one miss as news.
+
+**Every sync read is a fast sync read** (protocol 2.0 instruction 0x8A), enabled once on the
+controller so the tick's combined read, the slow read and the startup position read all use it
+without naming it. The instruction packet is a plain sync read's; what changes is the answer.
+Instead of sixteen status packets, each with its ten-byte protocol 2.0 header and each preceded
+by that device's turnaround, the devices append their blocks to **one** status packet from the
+broadcast id. The bus turns around once per tick rather than sixteen times, which is the same
+cost `return_delay_time = 0` above exists to hold down — the register check still matters,
+because every other transaction on this bus is an ordinary one that pays it per device.
+
+It is the same all-or-nothing shape, for a new reason: the blocks arrive in one packet, so a
+device whose firmware does not implement 0x8A simply does not answer and the read times out
+rather than coming back short. **XL330 firmware must be v46 or newer**, and the `imu_to_dxl`
+board — `id 200`, the first block in the tick's read — has to implement it too.
+
+That is firmware, not software, and it is the one thing on this bus the daemon cannot talk its
+way out of — so it is `bus.fast_sync_read`, **on by default**, rather than a constant. Off, every
+sync read is a plain one and the robot behaves exactly as it did before the instruction was used
+at all; `open_bus` says so once in the journal, because otherwise a robot running the slow path
+is indistinguishable from a slow robot.
+
+The default is the brave one because getting it wrong is unambiguous rather than subtle. A device
+that does not implement 0x8A does not answer at all, so *every* read times out — not some of them
+returning something plausible. The loop reports bus drops from its first tick, `min_achieved_hz`
+(§3.4) sees an unhealthy robot, and a release that turned this on against firmware that cannot do
+it rolls itself back. A robot that predates the firmware needs one key set, once, by whoever
+notices; there is no version negotiation here and no probe at startup, because a device that does
+not answer looks exactly like one that is unpowered and a probe would have to tell those apart
+before it could say anything useful.
 
 **Board temperature is a third source, and not on the bus at all.** The hottest of the SoC's
 thermal zones, read from `sysfs` in the same once-a-second sample (`robotd/src/soc.rs`). It
@@ -503,9 +574,44 @@ divergence: the prototype tracks the standing action scale by saving and restori
 `action_scale` across transitions, which can leave a stale value behind after a sit→stand cycle
 until the next walk; here scale and gain are recomputed from the active state every tick.
 
+**One move at a time, and none from the seat.** A ground pick, a skill, a sit or a rise is
+refused while any other is in flight — including the glide down into the seat — and only
+standing up is accepted from a seated robot. The one request a running skill takes is one for
+itself when it chains, which is the button being held. This is a second divergence: the
+prototype let a pick preempt a kick's tail and a roulade roll out of a kick or the seat, each a
+network handed a pose it was not trained from.
+
+The seat survives a deliberate stop and nothing else. Disabling the policy ends the move in
+flight and, on a seated robot, holds the seat where it is rather than sending the standing home
+pose, which a sitting robot can only reach by going over backwards; `robot.init` on a seated
+robot holds it too. A relax or a servo reboot forgets the seat and every move with it, so the
+next bring-up starts from a standing robot's state, as after a boot.
+
+**The robot is looked at twice** (`robotd/src/posture.rs`). When torque comes on, a robot that
+reads seated ramps to the seat — the sitstand policy's own trained SIT keyframe — instead of
+straight-legged to the standing home pose, which pulls it out of the seat and over backwards.
+And once per enable, before the policy takes over, because the ramp is open-loop: a robot that
+started folded can end it standing, sat back on its seat or on its back. That second look is
+taken even over a seat the controller already believes in. A seated verdict then runs the same
+sequence as a rise while the robot drives — the sitstand network holds the seat for its settle
+time, then rises — with its previous action and low-pass seeded from the held seat rather than
+zeroed: rising on the first tick, cold, from a seat the network had not chosen, went visibly
+worse than the same rise mid-session. The verdict comes from the trunk's height above the feet — the
+feet sites through the kinematic model, turned into the world by the IMU — and the trunk's tilt.
+Seated, the sitstand network rises first; standing, lying down (tilt past 45°) or in between,
+the gait takes over as it always has. The check picks how the policy starts, never whether: a
+Start is the person deciding the robot should drive. The
+height is the signal because the joint angles are not: three recorded seats with little in common
+joint by joint all read 15–39 % of standing height.
+
 Policy files come from paths in the params file, defaulting into the release directory — so a
 normal update carries the policy trained against the binary, and a dev points a path at their
 own `.onnx` and iterates without cutting a release.
+
+*Which* file fills a slot — the release's copy, a component from the Hub, or something a dev
+dropped on the board — is [`policy-channel-design.md`](policy-channel-design.md)'s, along with
+the commands that change it and what happens when a load fails. This section owns what a policy
+is and how it is validated and run, and stops there.
 
 Everything is validated at **load**, not at inference: observation width, action count, and
 whether ONNX Runtime is present at all. Every net must be 61-input, 14-output, checked at load
@@ -582,13 +688,20 @@ a robot lying on its side, and the wrong one for softening a landing: gravity pa
 `fall_gravity_z` held for 200 ms *is* the robot on the floor, and the window worth acting in
 has closed by then.
 
-So `limp_fall` (on by default since it was validated on a robot) runs a second, separate
-detector — `duck_control::fall` — on the rate rather than the position. Projected gravity
+So `limp_fall` (on by default; with the default velstand gait and no standing network, the
+hand-back is to velstand at zero command) runs a second, separate detector — `duck_control::fall` — on the rate rather than the position. Projected gravity
 rotates with the trunk, so `ġ = −ω × g` is exact and comes straight from the gyro in the same
 12-byte IMU block; extrapolating it over ~0.3 s says where gravity is heading. It fires when
 the robot is already tilted (≈26°), still tipping over rather than recovering, and predicted
 past the fall threshold — debounced three ticks. Differentiating the SFLP quaternion instead
 would add the filter's lag to the one number whose whole value is being early.
+
+It is armed only from standing: the robot must have been inside the tilt gate for
+`limp_fall_arm_ms` (200 ms), and firing disarms it until the robot has stood again. A fall
+happens to a robot that was up. Without the arm, the limp pose after a fall forwards leaves the
+robot on its front at ~58° — a hair short of `fall_gravity_z`, so not `fallen` — and the slow
+sag as the policy takes over is tilted, tipping and predicted past the threshold: limp, pose,
+hand back, limp again, until the fall verdict happened to latch.
 
 What it buys is not the landing itself but the stand-up after it. The standing policy gets a
 still robot in a known posture up cleanly and a thrashing one up only after several attempts
@@ -607,6 +720,52 @@ on the floor like any other tick.
 The tuning is the feature, and it is asymmetric: a false positive is a fall the robot
 *caused*, which is worse than the stiff landing it was trying to avoid. The defaults sit
 deliberately on the late side.
+
+#### 2.4.2 Being held is a fourth
+
+A policy has no idea its feet have left the floor. Picked up mid-walk, it keeps stepping, and the
+legs thrash in the hand until somebody presses Start — which is also the only way to get a robot
+that will hold still to be carried. `[pickup]` (on by default) notices instead: a small classifier,
+`duck_control::pickup`, reads the last second of what the loop already reads — gyro, projected
+gravity, joint positions and velocities, the target it commanded the tick before — and scores how
+likely it is that a hand is carrying the robot. Over 0.8 for 100 ms pauses the policy; under 0.35
+for 80 ms, once the pause is 300 ms old, hands it back.
+
+Paused is `driving` false (§1.4), like the limp-fall: the controller is not stepped, the targets
+come from the pause, and they reach the motors through `apply` with no exemption. The pause ramps
+from the policy's last target to a **pause pose** over 300 ms at the policy gain, and resuming is
+the ordinary rising edge of `driving`, so the controller is reset on the way back in. The pose is not
+home: home at walking gain is a balanced pose only for a policy that keeps balancing it, and in
+simulation a robot holding it on the floor tips past 40° within a second or two. The pause pose is
+the walking policy's own mean standing stance, which tips far more slowly and is the stance the
+policy expects to wake up in. That is also why resuming is the fast side of the band: a robot set
+down while paused is holding a fixed pose on the floor, and the sooner the policy has it back the
+less often it tips (in simulation, 3 % of set-downs at a 0.18 s median resume, 12 % at 0.30 s).
+
+It watches only the walking and standing networks in walk mode. A skill, a sit, the limp-fall, a
+disable or the shutdown sit owns the robot outright; any of them ends a pause and empties the
+window, and the next verdict waits for a full second of fresh history — the model was only shown
+complete windows, and one padded at startup paused a simulated robot a tenth of a second after
+boot. Roller mode is not watched at all: the model has never seen wheels.
+
+The model is trained entirely in simulation, in `microduck_rl` (`pickup/`, `scripts/pickup_*.py`):
+the deployed velstand walks, stands and falls under the training randomisation while a simulated
+hand — a mocap body welded softly to the trunk or the head — lifts, carries, holds it at any
+orientation including upside down, spins it, shakes it, sets it down and drops it. (The first
+model's hand only gripped the trunk and only passed through large tilts; on the robot it missed a
+duck lifted by the head and resumed when the duck was turned 180°.) The feature layout, the pause pose and the hysteresis timings
+are fixed there, which is why they are constants in `duck_control::pickup` and only the two
+thresholds are params: changing the rest here without retraining is the silent kind of wrong. The
+row carries servo current, but the shipped model drops it before its first layer — in simulation
+it separated held from standing far better than it does on a real robot. On the board the classifier
+costs a few tenths of a millisecond a tick (`cargo run --release -p duck-control --example
+pickup-bench` measures it there, next to a policy inference). The file ships in the release
+(`models/pickup_detector.onnx`), because its input is this loop's own layout and a model from
+another release is the wrong shape in a way no load check sees.
+
+Off means off: no model is opened and nothing is scored or recorded. A model that will not load is
+a warning rather than unhealthy, and a detector that errors mid-run lets go of any pause and starts
+over — it must never be what strands a robot paused.
 
 A spent pack is the other thing that moves the robot without being asked: with
 `safety.battery_empty_shutdown` (on by default), reaching the empty floor on the smoothed
@@ -693,6 +852,15 @@ from constants of its own, which is how the same pack shows two different number
 screens. A client drawing a battery pill should not have to know which pack this robot ships
 with. There is no fuel gauge: the measurement is the servos' own supply voltage (§2.1), so it
 sags under load and recovers at rest.
+
+**The span is a statement about the rail, and it holds because the rail *is* the pack** — the
+servos are fed the 2S battery, not a regulated 5 V, which is why the span runs from 6.6 to
+8.2 V across a servo whose own rating is 3.7–6.0 V. That does not make the two disagree: the
+servo's `Max Voltage Limit` is not written by anything here (§2.1), and the `shutdown` mask
+clears the input-voltage bit that would otherwise latch torque off above it, so a charged pack
+runs. A servo on a bench supply is answering the same question about a different rail — 5 V
+lands under 6.6 V and maps to 0%, which is the mapping working as defined rather than a fault
+to chase. Regulation would be a different robot, and these constants move with it.
 
 Same payload for `robotctl monitor` and, later, the app. This is what replaces the runtime's
 180-byte frame on 9870, the JPEG stream on 9871, the UDP command socket on 9872, the maploc
@@ -783,10 +951,9 @@ robot.
 
 | method | answer |
 |---|---|
-| `robot.health` | **the loop is meeting its deadline** — from achieved rate and missed-deadline count — plus a description of the robot the verdict never consults: loop, servo bus, IMU (now `ImuIo`: ready / stale counts), battery, servo and board temperature |
+| `robot.health` | **the loop is meeting its deadline** — from achieved rate and missed-deadline count — plus a description of the robot the verdict never consults: loop, bus, IMU, battery, servo and board temperature, and the board's clock ceiling |
 | `robot.safeToRestart` | false while the policy is enabled and the robot is moving |
 | `robot.modelApi` | constant |
-| `robot.remoteSessionActive` | `false` — `mediad` owns the real answer |
 
 Health is computed by the IPC side from atomics the loop publishes — a last-tick timestamp plus
 counters — never by asking the loop. That is what lets a *wedged* loop report itself unhealthy
@@ -798,10 +965,22 @@ distinction real is why the control loop was built before anything that walks (�
 **What may and may not reach the verdict.** `healthy` and `degraded` are the update system's
 inputs, so only conditions a *release* can be blamed for may set them — that is what `degraded`
 already exists to enforce for an unpowered bench board. Everything else on the answer is a
-**description**, and no automatic decision may read it: battery, motor temperature, and the
-loop/servo-bus/IMU counters. Gating on the battery would mean a robot updated on a low pack rolls the
-release back, then judges its replacement on the same low pack, and cannot be updated at all until
-someone works out why. Motor temperature would do the same on a hot afternoon.
+**description**, and no automatic decision may read it: battery, motor and board temperature, the
+clock ceiling, and the loop/bus/IMU counters. Gating on the battery would mean a robot updated on
+a low pack rolls the release back, then judges its replacement on the same low pack, and cannot be
+updated at all until someone works out why. Motor temperature would do the same on a hot
+afternoon, and a throttled clock on a robot that had got warm once — which is the strongest case
+of the three, since the release that would fix the heat is the one the gate would refuse to
+keep.
+
+**A run of failed reads could be either, so the loop asks the bus which.** A servo unplugged
+mid-run fails every sync read exactly as a release with a broken read path does, and only the
+second is something a rollback fixes. So once the run reaches `max_consecutive_errors`, and every
+few seconds while it lasts, the loop pings each servo and the IMU board. If any of them is silent,
+the verdict is degraded and names them, which is what the same robot gets on its next boot. If
+every one answers, or the ping itself fails, it stays unhealthy. Without the ping round, the
+verdict for the same hardware depended on whether it was unplugged before or after `robotd`
+started.
 
 **Why they travel together anyway.** One method, because the question arrives once: a robot
 behaving oddly gets asked "what is going on", and a verdict without the numbers behind it just
@@ -864,9 +1043,41 @@ single last-writer slot would lose.
 
 ### 4.2 Params
 
-A TOML file read at startup, **not watched** — live reload comes later. It lives outside
+A TOML file read at startup and, for the most part, **not watched**. It lives outside
 `releases/<ver>/` so it survives update *and* rollback, next to the updater's own config at
 `/etc/robot/robotd.toml`. The shipped template is `deploy/robotd.toml`.
+
+Two parts of it are watched, and both are exceptions earned by what a restart would cost rather
+than steps towards watching the whole file. Whichever pad daemon runs — `padd`, or `netpadd`
+for the pad over UDP — stats the file once a second and re-reads the controller sections
+(`[pad]`, `[pad_imu_head_control]`, `[pad_drive]`, `[pad_axes]`, `[pad_head]`, `[pad_body]` and
+`[pad_roller]`) when the mtime moves: a binding is changed from a phone, and restarting the
+daemon to apply it would drop the pad session and let `robotd`'s deadman zero a walking robot.
+Both read them through `pad-map`'s `Config::reload`, so the two cannot map a pad differently.
+The sections are replaced together after validation; a failed live read keeps the mapping in
+use. At startup, a missing or invalid file uses the built-in defaults.
+
+`[pad_axes]` selects logical gilrs axes (`left_x`, `left_y`, `right_x`, `right_y`, `none`) for
+robot commands, separately for `drive`, `head`, `head_drive` and `body_pose`. Each binding has
+`source`, `invert` and a nonnegative `gain`; omitted fields inherit the mode's shipped binding,
+including its sign. Values below `deadzone` are zeroed without rescaling the remaining travel,
+then inverted, multiplied by gain, clamped to ±1, and scaled to physical command limits.
+`none` or gain zero disables a binding. Limits live in `[pad_drive]` (walking m/s and rad/s),
+`[pad_roller]` (the same on wheels), `[pad_head]` (per-joint radians) and `[pad_body]` (height metres
+and tilt radians). Defaults reproduce the previous commands, including asymmetric crouch and
+roller push/brake. These are requested commands, not actuator limits or guarantees that a policy
+can reach the requested pose.
+
+D-pad mode selection and Start/Select holds remain fixed. With IMU head control active,
+`head_drive` uses the `drive` stick bindings while tilt drives the head through `[pad_head]` limits.
+Smoothing remains in `robotd`'s `[control]` settings. `--deadzone` and `--max-head`, on either
+daemon, override the corresponding file settings for bench use.
+
+`robotd` re-reads `[policy]` — all of it but `mode` and `enabled` — when asked to, which is how
+`robotctl policy add` lands a skill without taking motor control away from a standing robot.
+Re-reading `[safety]` or `[control]` under a running loop is a different and much larger promise,
+and it is still not made. `robotctl configure` knows which of the three answers a key wants, and
+a key that says nothing fails a test in `robotctl`.
 
 Belonging to the board rather than the release is what makes a hand-edited policy path stick: the
 defaults point inside `releases/<ver>/`, so an ordinary update keeps a policy alongside the
@@ -967,7 +1178,7 @@ arithmetic, it was that nothing read the answer.
 
 ### 4.5 What else the loop drives, and why none of it has a design page
 
-`robotd` grew four subsystems after slice 2 that are not control and not safety. They share a
+`robotd` grew five subsystems after slice 2 that are not control and not safety. They share a
 shape: each hangs off the tick, none may block it, and none can reach the bus except through the
 intents the loop already arbitrates.
 
@@ -975,21 +1186,26 @@ intents the loop already arbitrates.
 |---|---|---|
 | `sound.rs` | the voice at play time — one `aplay` child, and a new sound kills the old one, because the codec's PCM is exclusive | the module header |
 | `theremin.rs` | depth from `tofd` at 15 Hz → a note, a mouth opening, and a line of state, sampled by the 50 Hz loop and never waited on | the module header |
+| `laser.rs` | a laser dot from `mediad`'s `media.laser` (a ray, not a pixel) → a place on the floor through head FK, IMU and odometry → a head pose and a twist, each taken only while no client wants that half | the module header; the detector is `mediad/src/laser.rs` |
 | `chorale.rs` | several ducks singing one piece: the lowest id conducts, the conductor owns the seating, `btd` carries the beacons and does no thinking | the module header |
+| `emotion.rs` | an emotion = keyframes and a wav, shipped in the release with `[emotions] dir` on top, played by `robot.do <name>` through the same head, pose and mouth commands a client sends | the module header |
 | `pet-detect/` | a ~20 KB CNN over a 40-band log-mel window from the onboard mic, in its own worker | the crate header |
+| `vetbook.rs` | the robot's lifetime record: a tally the tick adds to without a lock, handed to the shared book once a second with `try_lock`, saved atomically once a minute; plus a 1-byte read of each servo's latched alerts every 10 s | the module header, and `duck_ipc_proto::vetbook` for the record |
 
-Plus `soc.rs`, which reads the board's own thermal zones out of `sysfs` — not behind `RobotIo`,
-because it has to keep answering when the motor bus does not.
+Plus `soc.rs`, which reads the board's own thermal zones and clock ceiling out of `sysfs` — not
+behind `RobotIo`, because it has to keep answering when the motor bus does not.
 
 **None of them has a design page, and that is the rule working rather than a gap.** A service earns
 one when a second reader would otherwise have to derive its contract from the code
 (`../README.md`). These have exactly one implementation and one consumer each, and their decisions
 are local enough to live in the module header next to what they constrain. What they need instead
-is to be *operable*, and that is the cheat sheet's job: [the voice], [the chorale], [the theremin].
+is to be *operable*, and that is the cheat sheet's job: [the voice], [the chorale], [the theremin],
+[laser tracking].
 
 [the voice]: ../robot/cheatsheet.md#the-voice
 [the chorale]: ../robot/cheatsheet.md#the-duck-chorale
 [the theremin]: ../robot/cheatsheet.md#play-the-duck-the-tof-theremin
+[laser tracking]: ../robot/cheatsheet.md#follow-a-laser-dot
 
 ## 5. Why it exists, and where it came from
 
@@ -1122,3 +1338,24 @@ path map now does. §4.4.
    has to reach the board, so prefer pure-Rust crates on that path. *Unverified on macOS:* the
    cross-build needs an aarch64 sysroot, which a Mac cannot provide, so `cargo board --bins` fails
    locally there — build the shipped set with `-p updater -p robotd -p robotctl`, or build on Linux.
+
+## Mapping telemetry (API v24)
+
+A mapper on the far end of the video — a laptop today, a server later — needs three things from
+the robot that `robot.state` did not carry: a clock shared with `tof.frame`, the IMU beyond its
+projected gravity, and where the camera and the ToF sensor are. All three are additive.
+
+- **`t_ns`** on `robot.state` and `tof.frame` is `CLOCK_MONOTONIC` in nanoseconds (`proto::clock`).
+  `t` and `at_us` stay: they are each daemon's own elapsed time, and a reader that only has one
+  stream still wants a number that starts at zero. `mediad`'s `media.video` answer reads
+  `mono_ns` and `real_ns` at one instant, so RTP timestamps — which RTCP sender reports state in
+  wall-clock — can be put on the same axis.
+- **`imu: {gyro, quat}`** is `ImuData` as the loop read it: the trunk IMU, 50 Hz, nothing above
+  it (`docs/design/robotd-design.md` §IMU). The head IMU on the prototype HAT is not read by
+  anything yet; when it is, it streams beside `tof.frame`, not here.
+- **`frames: {camera, tof}`** are trunk-frame poses at this tick's *measured* head joints from
+  `kinematics::head::HeadFk` — the same FK `robot.look` solves against — and **`robot.model`**
+  answers the static geometry (trunk height, joint order, ToF beam directions, the poses at head
+  zero). The kinematics stay in one crate; a client asks rather than transcribes.
+
+Cost: three small structs per published tick, only while someone is subscribed; the FK is ~50 ns.

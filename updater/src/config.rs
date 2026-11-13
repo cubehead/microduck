@@ -35,17 +35,34 @@ pub struct Config {
     /// see `docs/design/updater-design.md` §5.4.
     pub trusted_keys_dir: PathBuf,
 
-    /// Single forward-compatibility guard. An artifact declaring a higher
-    /// `min_hw_rev` than this is refused.
+    /// The hardware revision a release's `min_hw_rev` is checked against, for a robot whose
+    /// `robotd.toml` declares no board.
     ///
-    /// v1 targets one hardware configuration, so this is deliberately one
-    /// integer and not a capability matrix (`docs/design/updater-design.md` §5.6).
-    pub hw_rev: u32,
+    /// The board is the answer when there is one ([`Config::hw_rev`]). This is what every robot
+    /// installed before the board was a setting carries — `hw_rev = 1`, which is what its board
+    /// is — and what a board provisioned against a release that still shipped it carries too,
+    /// which is why it cannot win: a beta would be revision 1 for good, since the installer never
+    /// rewrites this file. One integer and not a capability matrix
+    /// (`docs/design/updater-design.md` §5.6).
+    #[serde(default)]
+    pub hw_rev: Option<u32>,
 
     /// Engine-owned state: lock file, update log, boot counter. Must NOT be
     /// inside any component's `install_dir` — it has to survive every swap and
     /// rollback (`docs/design/updater-design.md` §5.7).
     pub state_dir: PathBuf,
+
+    /// Where fetched policies are kept: one directory per `org/name/revision`, outside every
+    /// release directory so a policy somebody chose survives an update and a rollback
+    /// (`docs/design/updater-design.md` §5.7).
+    ///
+    /// **Configurable because it was a constant, and a constant is right exactly once.**
+    /// `/var/lib/robot/policies` is correct on a board and unwritable on the laptop the twin runs
+    /// on, so every `policy.fetch` against a simulated duck refused with `Permission denied (os
+    /// error 13)` naming a path no simulator should ever have been given. The default is still
+    /// the board's, so nothing in a release changes; `scripts/duck-sim` sets it per duck.
+    #[serde(default = "default_policy_library")]
+    pub policy_library: PathBuf,
 
     /// Where `robotd` listens. Used by every `health = { probe = "socket" }` component
     /// and by the pre-restart `safeToRestart` query.
@@ -55,8 +72,18 @@ pub struct Config {
     #[serde(default = "default_robot_socket")]
     pub robot_socket: PathBuf,
 
+    /// The `robotd.toml` whose `[update_gate] auto_rollback` decides whether a failed release is
+    /// reverted unasked ([`Self::auto_rollback`]). The board's by default; a test or a simulated
+    /// duck points it elsewhere.
+    #[serde(default = "default_robotd_config")]
+    pub robotd_config: PathBuf,
+
     /// Accept artifacts signed with a key marked dev-only. Off in production.
-    /// See `docs/design/updater-design.md` §15.
+    ///
+    /// Not the usual way to make a dev board any more: that is
+    /// [`duck_ipc_proto::DEV_BUILDS_MARKER`] in [`Self::state_dir`], which survives an A/B OS
+    /// update where this file does not. Either one turns dev keys on — [`Self::dev_keys_allowed`].
+    /// See `docs/design/updater-design.md` §5.4.
     #[serde(default)]
     pub allow_dev_keys: bool,
 
@@ -159,6 +186,14 @@ pub struct ComponentConfig {
     /// Refuse anything but this version. Set by `robotctl pin`.
     #[serde(default)]
     pub pinned: Option<semver::Version>,
+
+    /// Files required in the extracted artifact before hooks run or the release becomes live.
+    #[serde(default)]
+    pub required_files: Vec<PathBuf>,
+
+    /// Maximum compressed artifact size. When set, the signed manifest must declare a size.
+    #[serde(default)]
+    pub max_artifact_bytes: Option<u64>,
 }
 
 fn default_keep_previous() -> usize {
@@ -333,7 +368,35 @@ fn default_robot_socket() -> PathBuf {
     PathBuf::from("/run/robotd.sock")
 }
 
+fn default_robotd_config() -> PathBuf {
+    PathBuf::from(robotd_params::DEFAULT_PATH)
+}
+
+fn default_policy_library() -> PathBuf {
+    PathBuf::from(crate::policy::LIBRARY_ROOT)
+}
+
 impl Config {
+    /// Whether a release that fails — its gate, or its trial across boots — is reverted without
+    /// anyone asking. `[update_gate] auto_rollback` in [`Self::robotd_config`], off by default.
+    ///
+    /// Read at the moment of deciding rather than once at startup, so `robotctl configure`
+    /// applies without restarting `updaterd`. See `docs/design/updater-design.md` §8.
+    pub fn auto_rollback(&self) -> bool {
+        robotd_params::UpdateGate::auto_rollback_enabled(&self.robotd_config)
+    }
+
+    /// Whether dev-only keys count on this robot: `allow_dev_keys` in this file, or
+    /// [`duck_ipc_proto::DEV_BUILDS_MARKER`] in `state_dir` — which is what
+    /// `robotctl configure --allow-dev-daemon on` writes. Read at startup, like the rest.
+    pub fn dev_keys_allowed(&self) -> bool {
+        self.allow_dev_keys
+            || self
+                .state_dir
+                .join(duck_ipc_proto::DEV_BUILDS_MARKER)
+                .exists()
+    }
+
     /// Parse from TOML text. Always validated — an invalid config must not be
     /// constructible.
     pub fn from_toml(text: &str) -> Result<Self, crate::Error> {
@@ -352,6 +415,24 @@ impl Config {
         // this one's.
         config.loaded_from = Some(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
         Ok(config)
+    }
+
+    /// The hardware revision this robot is: the board `robotd.toml` declares, else this file's
+    /// `hw_rev`, else `zero3`'s.
+    ///
+    /// Read from the file every time rather than once at startup, so `robotctl configure`
+    /// applies without restarting `updaterd`.
+    pub fn hw_rev(&self) -> u32 {
+        self.hw_rev_given(robotd_params::board::Board::declared(std::path::Path::new(
+            robotd_params::DEFAULT_PATH,
+        )))
+    }
+
+    fn hw_rev_given(&self, declared: Option<robotd_params::board::Board>) -> u32 {
+        declared
+            .map(robotd_params::board::Board::hw_rev)
+            .or(self.hw_rev)
+            .unwrap_or_else(|| robotd_params::board::Board::default().hw_rev())
     }
 
     /// Bounds applied when extracting an artifact.
@@ -383,6 +464,24 @@ impl Config {
         }
 
         for (name, component) in &self.components {
+            for required in &component.required_files {
+                if required.as_os_str().is_empty()
+                    || !required
+                        .components()
+                        .all(|part| matches!(part, std::path::Component::Normal(_)))
+                {
+                    return bad(format!(
+                        "component {name}: required_files entry {} must be a nonempty relative file path without ..",
+                        required.display()
+                    ));
+                }
+            }
+            if component.max_artifact_bytes == Some(0) {
+                return bad(format!(
+                    "component {name}: max_artifact_bytes must be positive"
+                ));
+            }
+
             // A relative install_dir would resolve against the daemon's cwd,
             // which systemd does not guarantee.
             if !component.install_dir.is_absolute() {
@@ -428,6 +527,16 @@ impl Config {
             return bad(format!(
                 "state_dir must be absolute, got {}",
                 self.state_dir.display()
+            ));
+        }
+
+        // Same rule as `state_dir`, for the same reason: this is resolved by a daemon whose
+        // working directory is not anybody's, and a relative path there is a directory nobody
+        // meant to write to.
+        if !self.policy_library.is_absolute() {
+            return bad(format!(
+                "policy_library must be absolute, got {}",
+                self.policy_library.display()
             ));
         }
 
@@ -617,6 +726,23 @@ mod tests {
             "btd must be able to relay an update request from the app: {:?}",
             config.allow_users
         );
+        // And mediad, for the mutating calls its route table permits: `account.login`, and
+        // `policy.install`/`policy.fetch`, which were routed to WebRTC before this line existed
+        // and so answered PERMISSION_DENIED. Asserted rather than assumed because the failure is
+        // silent in the worst way — a button that reads as a broken feature rather than as a
+        // missing line in a config file.
+        assert!(
+            config.allow_users.iter().any(|u| u == "mediad"),
+            "mediad must be able to sign the robot in to an account: {:?}",
+            config.allow_users
+        );
+        // Neither entry may become a *group*: the two above are services, and the layering
+        // argument above is about exactly that distinction.
+        assert!(
+            config.allow_groups.is_empty(),
+            "change authority is granted to named services, not to groups: {:?}",
+            config.allow_groups
+        );
         assert_ne!(
             config.auto_apply,
             AutoApply::All,
@@ -731,6 +857,65 @@ mod tests {
 
         assert!(AutoApply::All.permits(true), "all must include mandatory");
         assert!(AutoApply::All.permits(false));
+    }
+
+    /// A declared board is the answer, whatever `hw_rev` says: a beta provisioned against a
+    /// release whose `updater.toml` still carried `hw_rev = 1` must not stay revision 1. Without
+    /// a board, `hw_rev` is the answer, and without either it is the zero3.
+    #[test]
+    fn the_declared_board_wins_over_hw_rev() {
+        use robotd_params::board::Board;
+        let base = r#"
+            trusted_keys_dir = "/etc/robot/keys"
+            state_dir = "/var/lib/robot/updater"
+            [component.daemon]
+            install_dir = "/opt/robot/daemon"
+            source = { type = "local_dir", path = "/var/tmp/rel" }
+            on_apply = { action = "none" }
+        "#;
+        let bare = Config::from_toml(base).unwrap();
+        assert_eq!(bare.hw_rev_given(None), Board::Zero3.hw_rev());
+        assert_eq!(bare.hw_rev_given(Some(Board::Beta)), Board::Beta.hw_rev());
+
+        let legacy = Config::from_toml(&format!("hw_rev = 1\n{base}")).unwrap();
+        assert_eq!(legacy.hw_rev_given(None), 1);
+        assert_eq!(legacy.hw_rev_given(Some(Board::Beta)), Board::Beta.hw_rev());
+    }
+
+    /// A board's config says nothing about the policy library and must keep getting the board's
+    /// path; a twin's says where it can actually write, and must be believed. Both halves matter:
+    /// the default is what every release depends on, and the override is the whole reason this
+    /// stopped being a constant — `/var/lib/robot/policies` is unwritable on the laptop the
+    /// simulator runs on, and a `policy.fetch` there refused with `Permission denied`.
+    #[test]
+    fn policy_library_defaults_to_the_board_and_can_be_moved() {
+        let base = r#"
+            trusted_keys_dir = "/etc/robot/keys"
+            hw_rev = 1
+            state_dir = "/var/lib/robot/updater"
+            [component.daemon]
+            install_dir = "/opt/robot/daemon"
+            source = { type = "local_dir", path = "/var/tmp/rel" }
+            on_apply = { action = "none" }
+        "#;
+        assert_eq!(
+            Config::from_toml(base).unwrap().policy_library,
+            PathBuf::from(crate::policy::LIBRARY_ROOT),
+            "a config that does not mention it must still get the board's library"
+        );
+
+        let moved = format!("policy_library = \"/tmp/ducks/duck-a/policies\"\n{base}");
+        assert_eq!(
+            Config::from_toml(&moved).unwrap().policy_library,
+            PathBuf::from("/tmp/ducks/duck-a/policies")
+        );
+
+        let relative = format!("policy_library = \"policies\"\n{base}");
+        let why = Config::from_toml(&relative).unwrap_err().to_string();
+        assert!(
+            why.contains("policy_library must be absolute"),
+            "a relative library is a directory nobody meant to write to: {why}"
+        );
     }
 
     /// The default has to be `mandatory`: a config that omits the field still needs to
@@ -873,6 +1058,30 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("no rollback target"), "got: {err}");
+    }
+
+    #[test]
+    fn component_guards_reject_invalid_paths_and_zero_budget() {
+        for setting in [
+            "required_files = ['']",
+            "required_files = ['.']",
+            "required_files = ['/bin/worker']",
+            "required_files = ['../worker']",
+            "required_files = ['bin/../../worker']",
+            "max_artifact_bytes = 0",
+        ] {
+            let err = config_with(&format!(
+                r#"
+                [component.daemon]
+                install_dir = "/opt/robot/daemon"
+                source = {{ type = "local_dir", path = "/var/tmp/rel" }}
+                on_apply = {{ action = "none" }}
+                {setting}
+                "#
+            ))
+            .unwrap_err();
+            assert!(matches!(err, crate::Error::Config(_)), "{setting}: {err}");
+        }
     }
 
     #[test]

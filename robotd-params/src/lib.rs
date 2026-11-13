@@ -9,6 +9,11 @@
 //! It lives outside `releases/<ver>/` so it survives an update *and* a rollback: this is
 //! per-robot configuration, not shipped defaults (`architecture.md` §3).
 //!
+//! **Two layers.** [`DEFAULT_PATH`] is what the image or installer wrote; [`USER_PATH`] holds the
+//! keys someone changed on this robot, and wins key by key. Only the user layer is on the
+//! partition an OS update leaves alone, so the image can move its own values forward while the
+//! owner's stay put. [`Params::load`] merges them; [`edit`] only ever writes the user layer.
+//!
 //! A crate of its own rather than a module of `robotd`, for one consumer: `robotctl
 //! configure` edits the file interactively, and doing that against a copied schema is how a
 //! copied schema drifts. [`registry`] is the machine-readable index of every key — what it
@@ -16,23 +21,177 @@
 //! test that walks [`Params`]'s own serialization, so a new section cannot be added without
 //! the registry (and therefore the editor) learning about it.
 
+pub mod board;
+pub mod edit;
+pub mod label;
 pub mod registry;
+pub mod serial;
+
+pub mod pad_axes;
+pub use pad_axes::{PadAxesParams, PadBodyParams, PadHeadParams, PadRollerParams};
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Where a release is mounted. Policy paths default under here, so an ordinary update
-/// carries the policy with the binaries that were trained against it.
+/// Where a release is mounted.
 pub const RELEASE_DIR: &str = "/opt/robot/daemon/current";
 
+/// Where the official policy set lives — **outside the release directory**, on purpose.
+///
+/// A gait retrain should not need a daemon release, and a daemon fix should not re-download six
+/// megabytes of unchanged weights. So the two version independently, and the daemon reads its
+/// policies from one place regardless of what put them there.
+///
+/// Today what puts them there is the daemon's own postinstall hook, which seeds this directory
+/// from the copies the release still carries. That is a bootstrap, not the destination: it stops
+/// the moment anything installs a real set here and repoints `current`, and `current` being a
+/// symlink beside a `releases/` directory is exactly the shape the updater already swaps
+/// atomically. See `docs/design/policy-channel-design.md` §9.
+pub const POLICY_DIR: &str = "/opt/robot/policies/current";
+
+/// Where the duck detector lives — outside the release, the way [`POLICY_DIR`] is, and for the
+/// same reason: the model is trained and published elsewhere (`pollen-robotics/duck_detector`,
+/// on the Hub as `pollen-robotics/microduck-duck-detector`), a retrain is a tag rather than a
+/// daemon release, and a daemon fix should not re-ship fourteen megabytes of unchanged weights.
+///
+/// Seeded by the release's own `scripts/seed-detector.sh`, moved past with
+/// `robotctl duck-detector update`; `current` is a symlink beside a `releases/` directory, the layout
+/// the policies use and the updater swaps atomically.
+pub const DETECTOR_DIR: &str = "/opt/robot/detector/current";
+
+/// Where policies fetched from the Hub one at a time live — `robotctl policy load <slot> <repo>`.
+///
+/// Outside every release directory, per `updater-design.md` §5.7: a policy somebody chose has to
+/// survive an update and a rollback. The layout mirrors the repo — `<org>/<name>/<revision>/` —
+/// which is what makes the path in `robotd.toml` say where a policy came from without anything
+/// having to look it up. `updater::policy::LIBRARY_ROOT` is the same string on the writing side.
+pub const POLICY_LIBRARY: &str = "/var/lib/robot/policies";
+
 /// Where a provisioned robot keeps it, alongside the updater's own config.
+///
+/// The *base* layer: what the image or the installer put there. On a robot that updates its OS
+/// by A/B slots this file is on the root filesystem, so every OS update replaces it — which is
+/// right for what the image decides (the board, the bus port) and wrong for anything an owner
+/// changed. Those go to [`USER_PATH`] instead. See [`user_layer_for`].
 pub const DEFAULT_PATH: &str = "/etc/robot/robotd.toml";
+
+/// The owner's layer over [`DEFAULT_PATH`]: only the keys somebody changed on this robot.
+///
+/// Under `/var/lib/robot` because that is the one tree that survives an OS update and a slot
+/// switch — a setting changed with `robotctl configure` or from the phone must not quietly
+/// revert the next time the robot takes a new image. Every writer goes here ([`edit`]); nothing
+/// writes the base any more.
+pub const USER_PATH: &str = "/var/lib/robot/robotd.toml";
+
+/// The user layer that goes with the file at `path`, if it has one.
+///
+/// Only the provisioned location is layered. A file named on the command line — a simulated
+/// duck's, a test's, a bench override — is read on its own, exactly as before layering existed,
+/// so it means what it says and nothing under `/var/lib/robot` can change it.
+pub fn user_layer_for(path: &Path) -> Option<PathBuf> {
+    (path == Path::new(DEFAULT_PATH)).then(|| PathBuf::from(USER_PATH))
+}
+
+/// When the config at `path` last changed, across both layers — for a reader that polls.
+///
+/// `padd` and `netpadd` re-read the file when this moves. Watching the base alone would miss
+/// every edit, since edits land in the user layer. A pair rather than the later of the two
+/// mtimes, so that deleting the user layer — a reset — is a change too.
+pub fn config_stamp(path: &Path) -> ConfigStamp {
+    let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    ConfigStamp {
+        base: mtime(path),
+        user: user_layer_for(path).and_then(|user| mtime(&user)),
+    }
+}
+
+/// See [`config_stamp`]. Compare two; the value means nothing on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ConfigStamp {
+    base: Option<std::time::SystemTime>,
+    user: Option<std::time::SystemTime>,
+}
+
+/// The config at `path` as one TOML document, both layers merged — for a reader that wants a
+/// few keys without the whole schema's validation (`Board::declared`, `edit::pad_bindings`).
+///
+/// A user layer that does not parse is left out, as [`Params::load`] leaves it out. `Ok("")`
+/// when neither file exists.
+pub fn layered_text(path: &Path) -> Result<String, String> {
+    let read = |p: &Path| read_optional(p).map_err(|e| format!("cannot read {}: {e}", p.display()));
+    let base = read(path)?.unwrap_or_default();
+    let Some(user) = user_layer_for(path)
+        .map(|u| read(&u))
+        .transpose()?
+        .flatten()
+    else {
+        return Ok(base);
+    };
+    let base_table: toml::Table = base
+        .parse()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    match user.parse::<toml::Table>() {
+        Ok(user_table) => Ok(merge_layers(base_table, user_table).to_string()),
+        Err(_) => Ok(base),
+    }
+}
+
+/// A file's text, or `None` when there is no file — a real state for either layer.
+fn read_optional(path: &Path) -> std::io::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// `user` over `base`: tables merge key by key, recursively; anything else — a value, an array,
+/// an array of tables — replaces the base's whole.
+///
+/// Replacing arrays whole is the only reading that lets a user layer *remove* an entry: a
+/// `[[policy.skill]]` list merged element-wise could only ever grow. The editor copies the base's
+/// list into the user layer before it first changes one ([`edit`]), so nothing is lost by it.
+///
+/// Renamed sections are normalised first, in both layers, so a base under the old name and a
+/// user layer under the new one merge into one table instead of tripping the loader's duplicate
+/// check.
+pub fn merge_layers(mut base: toml::Table, mut user: toml::Table) -> toml::Table {
+    normalise_renamed(&mut base);
+    normalise_renamed(&mut user);
+    merge_into(&mut base, user);
+    base
+}
+
+fn normalise_renamed(table: &mut toml::Table) {
+    for (old, new) in registry::RENAMED_SECTIONS {
+        if !table.contains_key(*new)
+            && let Some(value) = table.remove(*old)
+        {
+            table.insert((*new).to_owned(), value);
+        }
+    }
+}
+
+fn merge_into(base: &mut toml::Table, user: toml::Table) {
+    for (key, value) in user {
+        match (base.get_mut(&key), value) {
+            (Some(toml::Value::Table(below)), toml::Value::Table(above)) => {
+                merge_into(below, above);
+            }
+            (_, value) => {
+                base.insert(key, value);
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Params {
     pub platform: Platform,
+    /// Which electronic board this robot is built on. [`board`] says who reads it.
+    pub board: board::BoardParams,
     pub bus: Bus,
     pub imu: Imu,
     pub control: Control,
@@ -40,10 +199,275 @@ pub struct Params {
     pub policy: PolicyParams,
     pub safety: SafetyParams,
     pub audio: AudioParams,
+    pub emotions: EmotionsParams,
     pub theremin: ThereminParams,
+    /// Following a laser dot with the head and the legs. `robotd` reads it, and re-reads it while
+    /// tracking is on — see [`LaserParams`].
+    pub laser: LaserParams,
+    pub pickup: PickupParams,
+    pub head_imu: HeadImuParams,
     pub chorale: ChoraleParams,
+    pub idle: IdleParams,
     pub media: MediaParams,
-    pub detect: DetectParams,
+    ///
+    /// `[detect]` until 2026-09: in `robotctl configure` that read as "detect what?", one line
+    /// from `chorale.accept`. Named for what it detects. The alias keeps a file written under the
+    /// old name loading; the editor renames the section the next time it saves that file.
+    #[serde(alias = "detect")]
+    pub duck_detector: DuckDetectorParams,
+    /// Which pad button runs which skill. `padd` reads this, not `robotd`.
+    pub pad: PadParams,
+    /// Posing the head from the pad's own IMU. `padd` reads this too.
+    ///
+    /// Named for what it is, in full, because `[head_imu]` is two sections up and is the IMU *in*
+    /// the robot's head: the two were `imu_head` and `head_imu` for a while, and that is a name
+    /// apart, not a difference. The alias keeps a file written under the old name loading; the
+    /// editor renames the section the next time it saves that file.
+    #[serde(alias = "imu_head")]
+    pub pad_imu_head_control: PadImuHeadControlParams,
+    /// How fast full stick deflection drives the robot. `padd` reads this as well.
+    pub pad_drive: PadDriveParams,
+    /// Which stick drives which command, per D-pad mode. `padd` and `netpadd` read this, and
+    /// the three sections after it, through `pad-map`.
+    pub pad_axes: PadAxesParams,
+    /// Full-deflection head travel per joint.
+    pub pad_head: PadHeadParams,
+    /// Body + head mode's height and tilt ranges.
+    pub pad_body: PadBodyParams,
+    /// `[pad_drive]` on wheels.
+    pub pad_roller: PadRollerParams,
+    /// The pad over UDP: `netpadd` reads this, and so does `padd`, to know whether to stand down.
+    pub netpad: NetpadParams,
+    /// Why the user layer ([`USER_PATH`]) was set aside, when it was — not a key in any file.
+    ///
+    /// A broken user layer does not stop the robot: it runs on the base alone, and `robotd`
+    /// reports *degraded* with this reason. Refusing to start would leave a robot that one bad
+    /// hand edit had taken off its own update path, since an update of either kind now keeps the
+    /// file.
+    #[serde(skip)]
+    pub user_layer_rejected: Option<String>,
+}
+
+/// The pad's walking speed limits: what full stick deflection asks for, per axis and per
+/// direction.
+///
+/// Each axis has a bound per direction, signed in the robot's own frame — `vx` forward, `vy` to
+/// the left, `vyaw` counter-clockwise seen from above — so a `_min` is the bound in the negative
+/// direction and is itself negative (or zero, to forbid that direction). The stick is linear
+/// between centre and either bound. Walk mode only: on wheels it is `[pad_roller]`.
+///
+/// This is what the *pad* asks for, not a limit on the robot. A `robot.move` from anywhere else
+/// is not bounded by it, and the policy only follows commands inside the range it was trained
+/// on — asking for more than that is asking, not getting.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PadDriveParams {
+    /// Full stick forward, m/s.
+    pub vx_max: f64,
+    /// Full stick back, m/s — negative.
+    pub vx_min: f64,
+    /// Full stick left, m/s.
+    pub vy_max: f64,
+    /// Full stick right, m/s — negative.
+    pub vy_min: f64,
+    /// Full right stick left (turn left), rad/s.
+    pub vyaw_max: f64,
+    /// Full right stick right (turn right), rad/s — negative.
+    pub vyaw_min: f64,
+}
+
+impl Default for PadDriveParams {
+    /// Started as the prototype's alpha defaults (`padd`'s old command-line defaults). Forward is
+    /// 0.4 m/s and turning 1.0 rad/s since the v8 velstand; the v9 set went back to the v7
+    /// velstand, and these still feel right on the robot. Back is 0.3 m/s.
+    fn default() -> Self {
+        Self {
+            vx_max: 0.4,
+            vx_min: -0.3,
+            vy_max: 0.3,
+            vy_min: -0.3,
+            vyaw_max: 1.0,
+            vyaw_min: -1.0,
+        }
+    }
+}
+
+impl PadDriveParams {
+    /// Each axis as `(name, min, max)`, for validation and logging.
+    pub fn axes(&self) -> [(&'static str, f64, f64); 3] {
+        [
+            ("vx", self.vx_min, self.vx_max),
+            ("vy", self.vy_min, self.vy_max),
+            ("vyaw", self.vyaw_min, self.vyaw_max),
+        ]
+    }
+
+    /// A stick deflection in `[-1, 1]` scaled onto `[min, max]`: positive deflection towards
+    /// `max`, negative towards `min`, linear on each side of centre.
+    pub fn scale(deflection: f64, min: f64, max: f64) -> f64 {
+        if deflection >= 0.0 {
+            deflection * max
+        } else {
+            -deflection * min
+        }
+    }
+}
+
+/// A gamepad over UDP, from a program on the LAN — `netpadd`. `docs/robot/udp-pad.md` owns it.
+///
+/// `enabled` is the switch between the two pad daemons, not a feature flag on one: both units ask
+/// it in `ExecCondition=`, so exactly one of `padd` and `netpadd` runs, and an update's restart of
+/// every shipped unit reaches the same answer as a boot does.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct NetpadParams {
+    /// UDP is the pad source; `padd` stands down.
+    pub enabled: bool,
+    /// The UDP port, bound on IPv4 0.0.0.0.
+    pub port: u16,
+    /// At most this many intent frames a second reach robotd. A change is sent at once when the
+    /// last send is at least one interval old, otherwise at the next slot — never queued.
+    pub max_hz: u32,
+    /// Nothing new for this long and the robot is stopped where it stands, the client kept: a blip
+    /// on Wi-Fi costs a stop, not the session. Also how late a datagram may be delivered and still
+    /// drive. Below `[safety] deadman_ms`, or a stalled client's last stick would keep the deadman
+    /// fed.
+    pub stale_ms: u64,
+    /// Silence after which the client counts as gone: the lock released, holds reset, and a second
+    /// later the robot sits.
+    pub timeout_ms: u64,
+}
+
+impl Default for NetpadParams {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: 4210,
+            max_hz: 30,
+            stale_ms: 300,
+            timeout_ms: 1000,
+        }
+    }
+}
+
+/// Controller-IMU head control: pose the head by tilting the pad.
+///
+/// Some pads carry an inertial unit — the "Pro Controller" Switch clones do; an Xbox pad does not.
+/// With this on and such a pad connected, head + move mode (**D-pad right**) stops meaning "the
+/// right stick poses the head" and means "the pad's tilt poses the head": the sticks keep the
+/// whole drive mapping, and turning the pad in your hands turns the robot's head. Press D-pad
+/// right again and the pad drives the head **from where the pad is now** — the pad's yaw comes
+/// from a gyro and drifts, and re-centring on every press is how a person beats the drift
+/// without a magnetometer.
+///
+/// Off, or on a pad with no IMU, the right stick poses the head in that mode. Nothing else about
+/// the pad changes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PadImuHeadControlParams {
+    /// Whether head + move mode follows the pad's IMU on a pad that has one.
+    pub enabled: bool,
+    /// Head radians per pad radian. One is "the head turns as far as the pad did"; more makes a
+    /// small wrist movement a large head movement. The head's own travel limit still applies.
+    pub gain: f64,
+}
+
+impl Default for PadImuHeadControlParams {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            gain: 1.0,
+        }
+    }
+}
+
+/// Which pad button runs which skill.
+///
+/// **The six one-shot buttons, and only those:** the four face buttons and the two bumpers.
+/// `Start` stands the robot up and toggles the policy, the D-pad picks what the sticks mean, and
+/// held `Select` cuts torque and then powers the robot off — none of those is a `robot.do`, and
+/// turning them into a general button-to-action vocabulary is a larger thing than binding a skill
+/// needs. It would also put "the button that stops the robot" behind a config key, which is the
+/// one binding worth not being able to lose.
+///
+/// The defaults: A sits or stands, B picks up, the bumpers nod yes and shake no, Y is excited —
+/// three emotions (`robotd/src/emotion.rs`) — and X does nothing until somebody puts a skill there
+/// (the kicks are still in the set, unbound). An emotion whose files are missing is a skill the
+/// robot does not have, so its button does nothing. A named button is rebound; the rest stay as
+/// they were.
+///
+/// A name here is not checked against anything at parse time: which skills exist is a property of
+/// the robot, and `padd` learns it from `robot.subscribe`. An unknown name is refused by `robotd`
+/// with the list it does know, which is a better error than a config file could give.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PadParams {
+    /// A (South). Sit ↔ stand, by default. Unused on a roller robot, as is X.
+    pub a: String,
+    /// B (East). The ground pick, by default.
+    pub b: String,
+    /// X (West). Free by default. Held, it is re-sent every tick, so a chaining skill such as
+    /// the roulade keeps going for as long as it is held.
+    pub x: String,
+    /// Y (North). The excited emotion, by default.
+    pub y: String,
+    /// The left bumper — `LeftTrigger` in gilrs, which names the *analog* trigger
+    /// `LeftTrigger2`. Getting that backwards binds a skill to a control nobody presses. The yes
+    /// emotion, by default.
+    pub lb: String,
+    /// The right bumper, likewise. The no emotion, by default.
+    pub rb: String,
+}
+
+impl Default for PadParams {
+    fn default() -> Self {
+        Self {
+            a: "sit_toggle".to_owned(),
+            b: "ground_pick".to_owned(),
+            x: String::new(),
+            y: "excited".to_owned(),
+            lb: "yes".to_owned(),
+            rb: "no".to_owned(),
+        }
+    }
+}
+
+impl PadParams {
+    /// The bindable buttons, in the order a listing should print them.
+    pub const BUTTONS: [&'static str; 6] = ["a", "b", "x", "y", "lb", "rb"];
+
+    /// What a button runs, or `None` for a name this build has no button for.
+    pub fn skill(&self, button: &str) -> Option<&str> {
+        Some(match button {
+            "a" => &self.a,
+            "b" => &self.b,
+            "x" => &self.x,
+            "y" => &self.y,
+            "lb" => &self.lb,
+            "rb" => &self.rb,
+            _ => return None,
+        })
+    }
+
+    /// Bind a button to a skill. `false` for a button this build does not have.
+    pub fn bind(&mut self, button: &str, skill: &str) -> bool {
+        let slot = match button {
+            "a" => &mut self.a,
+            "b" => &mut self.b,
+            "x" => &mut self.x,
+            "y" => &mut self.y,
+            "lb" => &mut self.lb,
+            "rb" => &mut self.rb,
+            _ => return false,
+        };
+        *slot = skill.to_owned();
+        true
+    }
+
+    /// Every button name, for the "expected one of" half of a refusal.
+    pub fn names() -> String {
+        Self::BUTTONS.join(", ")
+    }
 }
 
 /// The one video mode a robot streams in, as a name rather than four numbers.
@@ -195,6 +619,134 @@ impl CongestionControl {
     }
 }
 
+/// Where `mediad`'s video comes from.
+///
+/// **This was `camera: bool`, and the boolean was the problem.** `camera = false` does not mean
+/// "no video" — the WebRTC control channel rides the video track, so a pipeline that never starts
+/// costs a robot its control surface along with its picture (`remote-webrtc.md`). What it means is
+/// "a test pattern instead", and nothing in the key said so: a board set up with no camera streamed
+/// 720p30 of synthetic video, which is how the pattern came to cost five times what the camera it
+/// stands in for does. A name that says what you get is the fix for the next person reading it.
+///
+/// `--sim-camera` is not a value here. It carries an address, so it is a flag, and it overrides
+/// this the way it always has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MediaSource {
+    /// The head camera, at [`Quality`]. What every robot with a camera wants, and the default.
+    #[default]
+    Camera,
+    /// A test pattern at [`TEST_PATTERN_GEOMETRY`], for a board with no camera: the session
+    /// exists, so signalling, negotiation, the datachannel and the control API are all reachable.
+    Test,
+}
+
+/// Every source, in the order an editor cycles them — and the strings the file uses.
+///
+/// One list, for [`QUALITY_LABELS`]'s reason; [`tests::every_media_source_label_round_trips`]
+/// pins it to the enum in both directions.
+pub const MEDIA_SOURCE_LABELS: &[&str] = &["camera", "test"];
+
+impl MediaSource {
+    /// The sources, in [`MEDIA_SOURCE_LABELS`] order.
+    pub const ALL: [MediaSource; 2] = [MediaSource::Camera, MediaSource::Test];
+
+    /// The name this source has in the file.
+    pub fn label(self) -> &'static str {
+        match self {
+            MediaSource::Camera => "camera",
+            MediaSource::Test => "test",
+        }
+    }
+}
+
+/// A head camera sensor this project builds robots with — the substring its driver puts in the
+/// media graph's entity name (`m00_b_gc2093 2-0037`).
+///
+/// Which one a robot has is its board's ([`board::Board::camera_sensor`]), unless `[media] sensor`
+/// forces another. `mediad` keeps one profile per variant, matched exhaustively, so a sensor added
+/// here does not build until it has one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CameraSensor {
+    /// Sony's, on the Zero 3W robots.
+    Imx219,
+    /// GalaxyCore's, on the beta board.
+    Gc2093,
+}
+
+impl CameraSensor {
+    /// The name this sensor has in the file and in the media graph.
+    pub fn label(self) -> &'static str {
+        match self {
+            CameraSensor::Imx219 => "imx219",
+            CameraSensor::Gc2093 => "gc2093",
+        }
+    }
+}
+
+/// Which sensor the head camera must be: the board's, or one forced by name.
+///
+/// **`board` is the default and the normal case.** A camera and its board go together, so a
+/// robot whose media graph holds another sensor is refused — that is a robot assembled with the
+/// wrong module, or one declaring the wrong board. Naming a sensor here is for the exception: a
+/// board fitted with another camera on purpose, on a bench.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MediaSensor {
+    #[default]
+    Board,
+    Imx219,
+    Gc2093,
+}
+
+/// Every choice, in the order an editor cycles them — and the strings the file uses.
+/// [`tests::every_media_sensor_label_round_trips`] pins it to the enum in both directions.
+pub const MEDIA_SENSOR_LABELS: &[&str] = &["board", "imx219", "gc2093"];
+
+impl MediaSensor {
+    /// The choices, in [`MEDIA_SENSOR_LABELS`] order.
+    pub const ALL: [MediaSensor; 3] =
+        [MediaSensor::Board, MediaSensor::Imx219, MediaSensor::Gc2093];
+
+    /// The name this choice has in the file.
+    pub fn label(self) -> &'static str {
+        match self {
+            MediaSensor::Board => "board",
+            MediaSensor::Imx219 => "imx219",
+            MediaSensor::Gc2093 => "gc2093",
+        }
+    }
+
+    /// The sensor a forced choice names, or `None` for `board`.
+    pub fn forced(self) -> Option<CameraSensor> {
+        match self {
+            MediaSensor::Board => None,
+            MediaSensor::Imx219 => Some(CameraSensor::Imx219),
+            MediaSensor::Gc2093 => Some(CameraSensor::Gc2093),
+        }
+    }
+
+    /// The sensor the head camera must be on `board`.
+    pub fn resolve(self, board: board::Board) -> CameraSensor {
+        self.forced().unwrap_or_else(|| board.camera_sensor())
+    }
+}
+
+/// What a test pattern runs at, whatever `[media] quality` says — width, height, frames a second.
+///
+/// **A test pattern is not video anybody watches.** It exists so a board with no camera still has
+/// a whole session — signalling, negotiation, the datachannel, the control API — and none of that
+/// needs the rung a camera streams at. Running it at the configured rung instead is what an idle
+/// radxa-zero3 was measured doing: **29.4% of a core against the real camera's 6.1%** on the same
+/// board, with nothing connected. A camera's frames arrive off the ISP in hardware, while a test
+/// pattern is drawn by the CPU — at 720p30, 1.84 MB of packed UYVY thirty times a second, every
+/// frame discarded unread. This is 73 KB five times a second: 0.7% of that pixel rate.
+///
+/// 16:9 with both axes a multiple of 8, for [`Quality::size`]'s reason. Five frames a second is
+/// still a live stream — enough to prove the path end to end, which is all it is for.
+pub const TEST_PATTERN_GEOMETRY: (u32, u32, u32) = (256, 144, 5);
+
 /// `[media]` — what `mediad` streams.
 ///
 /// **These were command-line flags in `mediad.service`, and that is why this section exists.**
@@ -214,9 +766,9 @@ impl CongestionControl {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct MediaParams {
-    /// Stream the head camera. `false` streams a test pattern instead, which is what a board
-    /// with no camera wants: the pipeline starts, so the WebRTC control channel exists.
-    pub camera: bool,
+    /// Where the video comes from: the head camera, or a test pattern for a board without one.
+    /// [`MediaSource`] says why this is a name rather than a boolean.
+    pub source: MediaSource,
     /// Frame size and rate, as one name. [`Quality`] says why it is one key and not four.
     pub quality: Quality,
     /// Starting video bitrate, bits per second. Unset follows the quality —
@@ -228,25 +780,132 @@ pub struct MediaParams {
     /// Whether the send rate adapts to the link, and by what. [`CongestionControl`] has the
     /// trade — it is the largest single CPU consumer in this process.
     pub congestion_control: CongestionControl,
+    /// This robot's own measured camera geometry, when somebody has written a `[media.intrinsics]`
+    /// table for it — and only then.
+    ///
+    /// Absent is the common case and not a gap: `mediad` falls back to the hardware family's
+    /// calibration ([`CameraIntrinsics::alpha`] — the camera and lens are one part across a
+    /// revision, so it is a real solve of the same optics) and publishes it tagged `source:
+    /// "family"`, with the module's design figures (`source: "nominal"`) below that for a camera
+    /// nobody has solved at all. So this stays `Some` only for a per-robot solve, which is exactly
+    /// what lets `media.video` distinguish *this* robot's calibration from the family's. See
+    /// [`CameraIntrinsics`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intrinsics: Option<CameraIntrinsics>,
+    /// Which sensor the head camera must be. `board`, the default, is the declared board's — see
+    /// [`MediaSensor`] for why anything else is the exception.
+    pub sensor: MediaSensor,
 }
 
-impl Default for MediaParams {
-    fn default() -> Self {
+/// A camera calibration, as OpenCV's `calibrateCamera` produces one.
+///
+/// **The resolution it was measured at is part of the record**, because intrinsics are in pixels:
+/// the same camera calibrated at 1280×720 and at 640×360 yields numbers that differ by a factor of
+/// two and describe the same optics. `mediad` scales them to whatever is being streamed, and
+/// refuses to when the aspect ratio differs — a frame of another shape is not a resize of this
+/// one, and which part was cropped is not recoverable from its size.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CameraIntrinsics {
+    /// The frame size these were measured at, in pixels.
+    pub width: u32,
+    pub height: u32,
+    /// Focal length in pixels, per axis. Equal for square pixels, which these are.
+    pub fx: f64,
+    pub fy: f64,
+    /// Where the optical axis crosses the image, in pixels from the top-left of the **delivered,
+    /// unrotated** frame. A few pixels off centre on a real module.
+    pub cx: f64,
+    pub cy: f64,
+    /// `k1 k2 p1 p2 k3`, OpenCV's order. Empty for a calibration that did not model distortion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub distortion: Vec<f64>,
+}
+
+impl CameraIntrinsics {
+    /// The beta family's camera calibration: the GC2093 on Seeed's main board and its lens, one part across
+    /// the family like the alpha's, so one solve is every unit's.
+    ///
+    /// Solved on unit *sky-gtc*, 2026-10-28 — a printed 11×8 ChArUco (`DICT_4X4_1000`, legacy pattern, 20.75 mm
+    /// squares), 80 views, 1.28 px RMS (per view: median 1.1, max 2.7 — spread evenly, not a few outliers, and
+    /// every-frame and every-third-frame solves agree within 3 px on the principal point; a slower recording on a
+    /// rigid board should bring it under 1), on the 1280×720 frame as `mediad` sends it: a scaled readout of the
+    /// sensor's only 1920×1080 mode, so the same field at any size `mediad` streams. Mounted upright
+    /// (`rotate` 0), ~85° horizontal and ~55° vertical field — wider than the alpha's 62°.
+    /// Re-solve with `duckslam calib intrinsics`; `duckslam calib export-toml` prints this shape.
+    pub fn beta() -> Self {
         Self {
-            // On, because a robot with a camera is the case, and a board without one shows a
-            // test pattern rather than nothing only if somebody turns this off.
-            camera: true,
-            quality: Quality::default(),
-            bitrate: None,
-            // `webrtcsink`'s own default, named rather than inherited: what the element defaults
-            // to is a fact about a plugin we ship from a pinned release, and the day it changes
-            // should not be the day every robot's send rate changes with it.
-            congestion_control: CongestionControl::default(),
+            width: 1280,
+            height: 720,
+            fx: 695.6216231288809,
+            fy: 696.0209167299262,
+            cx: 627.4740538073111,
+            cy: 363.60566030048255,
+            distortion: vec![
+                -0.368607360841971,
+                0.13550162561831905,
+                0.00012682873881955374,
+                0.0008719998338708391,
+                -0.022368269599378002,
+            ],
+        }
+    }
+
+    /// The alpha family's camera calibration: the head camera module and M12 lens every alpha unit
+    /// carries — one part across the family, so one solve is every unit's calibration.
+    ///
+    /// Solved on unit *graphite*, 2026-09-08 — ChArUco board on a screen (caliper-measured), 80
+    /// views, 0.79 px RMS, on the 1280×720 frame as `mediad` sends it (unrotated). This is the
+    /// **~62° full field of view** of the production `1920×1080@30` sensor mode: on this board's
+    /// IMX219 driver that mode is a scaled full-frame readout, not the native 1920×1080 crop the
+    /// datasheet describes — validated on hardware, the solved HFOV is 62°, not 39°. (`SensorMode`
+    /// and [`super`]'s nominal model still assume the crop; they are only the fallback this
+    /// overrides, but they are wrong for this hardware and should be corrected when touched.)
+    /// Re-solve with `duckslam calib intrinsics`; `duckslam calib export-toml` prints this shape.
+    pub fn alpha() -> Self {
+        Self {
+            width: 1280,
+            height: 720,
+            fx: 1061.8060025020175,
+            fy: 1062.193713957031,
+            cx: 596.7776848217006,
+            cy: 474.52348043048636,
+            distortion: vec![
+                -0.34695388691888,
+                0.14615866153945595,
+                -0.0007449157712424215,
+                -0.0022167170528743837,
+                -0.016437266141048814,
+            ],
         }
     }
 }
 
-/// `[detect]` — finding other ducks in the camera.
+// Derivable since `camera: bool` became `source: MediaSource`, and still written out: every line
+// of it is a decision with a reason beside it, and `#[derive(Default)]` would delete the reasons
+// while keeping the values. The next field added here should have to say what its default is for.
+#[allow(clippy::derivable_impls)]
+impl Default for MediaParams {
+    fn default() -> Self {
+        Self {
+            // The camera, because a robot with a camera is the case. A board without one shows a
+            // test pattern instead, and only if somebody names it.
+            source: MediaSource::Camera,
+            quality: Quality::default(),
+            bitrate: None,
+            // Only a per-robot solve goes here; the family calibration is `mediad`'s fallback.
+            intrinsics: None,
+            // `webrtcsink`'s own default, named rather than inherited: what the element defaults
+            // to is a fact about a plugin we ship from a pinned release, and the day it changes
+            // should not be the day every robot's send rate changes with it.
+            congestion_control: CongestionControl::default(),
+            // The board's camera: a sensor named here is a deliberate exception.
+            sensor: MediaSensor::Board,
+        }
+    }
+}
+
+/// `[duck_detector]` — finding other ducks in the camera.
 ///
 /// **Read by `mediad`, not by `robotd`**, which is a first for this file: the frames are on
 /// `mediad`'s tee and perception belongs next to the sensor. It lives here anyway, because this is
@@ -255,12 +914,13 @@ impl Default for MediaParams {
 /// find.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
-pub struct DetectParams {
-    /// Off by default. The detector costs a model in the release, ~50 ms of CPU per frame and some
-    /// heat; a robot that nothing asks to look for ducks should not be paying for it.
+pub struct DuckDetectorParams {
+    /// Off by default. The detector costs ~50 ms of CPU per frame and some heat; a robot that
+    /// nothing asks to look for ducks should not be paying for it.
     pub enabled: bool,
     /// Where to look, and therefore *what runs it*: a `.rknn` goes to the NPU, an `.onnx` runs on
-    /// the CPU. Absent means the release's own model, NPU first — see [`DetectParams::model`].
+    /// the CPU. Absent means the installed set under [`DETECTOR_DIR`], NPU first — see
+    /// [`DuckDetectorParams::models`].
     pub model: Option<PathBuf>,
     /// Frames per second to run the detector at.
     ///
@@ -276,7 +936,7 @@ pub struct DetectParams {
     pub threshold: f32,
 }
 
-impl Default for DetectParams {
+impl Default for DuckDetectorParams {
     fn default() -> Self {
         Self {
             enabled: false,
@@ -293,9 +953,25 @@ impl MediaParams {
         self.bitrate
             .unwrap_or_else(|| self.quality.default_bitrate())
     }
+
+    /// Frame size and rate the pipeline will actually run at — width, height, frames a second.
+    ///
+    /// [`Quality`], except for the test pattern, which gets [`TEST_PATTERN_GEOMETRY`] instead.
+    /// A simulated camera is a camera: `--sim-camera` renders the configured rung, and `mediad`
+    /// applies that precedence where it picks the source.
+    pub fn geometry(&self) -> (u32, u32, u32) {
+        match self.source {
+            MediaSource::Camera => (
+                self.quality.width(),
+                self.quality.height(),
+                self.quality.fps(),
+            ),
+            MediaSource::Test => TEST_PATTERN_GEOMETRY,
+        }
+    }
 }
 
-impl DetectParams {
+impl DuckDetectorParams {
     /// The models to try, best first. Empty when the detector is off.
     ///
     /// **A list, not a choice**, because whether the NPU works is not something this file can know.
@@ -305,6 +981,11 @@ impl DetectParams {
     /// board still sees, on the CPU, instead of logging one warning and doing nothing for ever.
     ///
     /// An explicit `model` is the operator being specific, so it is tried alone.
+    ///
+    /// **Not filtered on existence.** A board whose set was never seeded — first install with no
+    /// network — has neither file, and an empty list here would read as "detector off" in
+    /// `mediad`'s journal when the truth is "detector on, model missing". Letting the loader fail
+    /// on the path names the directory and what fills it.
     pub fn models(&self) -> Vec<PathBuf> {
         if !self.enabled {
             return Vec::new();
@@ -315,16 +996,15 @@ impl DetectParams {
             }
             return vec![path.clone()];
         }
-        let release = PathBuf::from(RELEASE_DIR).join("models");
-        [
-            release.join("duck_detect.rknn"),
-            release.join("duck_detect.onnx"),
-        ]
-        .into_iter()
-        .filter(|path| path.exists())
-        .collect()
+        let set = PathBuf::from(DETECTOR_DIR);
+        DETECTOR_FILES.iter().map(|name| set.join(name)).collect()
     }
 }
+
+/// The two files a detector set holds, NPU first. `scripts/seed-detector.sh` and
+/// `updater::policy::DETECTOR_FILES` download exactly this list, and a test in each place holds
+/// them together.
+pub const DETECTOR_FILES: [&str; 2] = ["duck_detect.rknn", "duck_detect.onnx"];
 
 /// `[chorale]` — several ducks singing one piece.
 ///
@@ -341,6 +1021,209 @@ pub struct ChoraleParams {
     pub accept: bool,
 }
 
+/// `[idle]` — the robot looking around while nothing is happening (`robotd/src/idle_head.rs`).
+///
+/// After `after_s` with no motion asked for and nobody steering the head, it glances somewhere,
+/// holds the look while shifting its gaze a little around it, and picks somewhere new; a slow
+/// drift and a breath ride on top, and the longer it is left alone the calmer it gets. Every
+/// number here is a tuning knob for how alive that reads, nothing more: none of them can move
+/// the head further than `glance_yaw` + `nudge_yaw` + `drift` from where it was asked to be, or
+/// pitch it further than `yawn_pitch` beyond that.
+///
+/// Angles are radians, durations seconds. Read once at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct IdleParams {
+    /// Master switch. Absent resolves per mode ([`Self::enabled_in`]): on walking, off on the
+    /// roller.
+    pub enabled: Option<bool>,
+    /// Still for this long before it starts.
+    pub after_s: f64,
+    /// How long it takes to fade in, and out.
+    pub fade_s: f64,
+    /// How far a glance turns the head left or right at most.
+    pub glance_yaw: f64,
+    /// How far a glance tips it up or down at most.
+    pub glance_pitch: f64,
+    /// How far a glance leans the neck forward or back at most — posture under the look, so
+    /// the whole head shifts rather than only the face turning.
+    pub glance_neck: f64,
+    /// How far a look opens the beak at most, 0..1 — eased with the glance, so the mouth moves
+    /// a little as the robot looks about; each look opens it between half and all of this.
+    /// Below about 0.15 it does not visibly open: closed is held a few degrees past shut.
+    /// Zero keeps it shut but for the yawns.
+    pub glance_mouth: f64,
+    /// The curious sideways tilt a glance sometimes comes with.
+    pub tilt_roll: f64,
+    /// How often a glance comes with the tilt, 0..1.
+    pub tilt_chance: f64,
+    /// How often a glance goes back to the middle rather than somewhere new, 0..1.
+    pub centre_chance: f64,
+    /// How far a new look is from the last one at least, yaw and pitch together — so a glance
+    /// never lands where the head already is and reads as dithering.
+    pub glance_min: f64,
+    /// How long one look lasts before it picks somewhere new, at full energy; dozing stretches
+    /// it.
+    pub hold_min_s: f64,
+    pub hold_max_s: f64,
+    /// How long a move takes: this much, plus `move_s_per_rad` for every radian it travels.
+    pub move_min_s: f64,
+    pub move_s_per_rad: f64,
+    /// While holding a look, the gaze shifts this far around it, yaw and pitch — the small
+    /// re-fixations that keep a held look from reading as frozen. Zero turns them off.
+    pub nudge_yaw: f64,
+    pub nudge_pitch: f64,
+    /// How long between those shifts.
+    pub nudge_every_min_s: f64,
+    pub nudge_every_max_s: f64,
+    /// The slow drift on every head axis, radians, and its frequency in Hz.
+    pub drift: f64,
+    pub drift_hz: f64,
+    /// The breath: metres of body height, and seconds per breath. Standing network only.
+    pub breath_m: f64,
+    pub breath_period_s: f64,
+    /// Dozing: seconds until it is mostly calmed down, and how calm it gets, 0..1 — 1 never
+    /// dozes.
+    pub doze_tau_s: f64,
+    pub doze_floor: f64,
+    /// Yawning, once it has been idle `yawn_after_s`: about every `yawn_every_s` (0 never), for
+    /// `yawn_s`, the mouth opens to `yawn_open` (0..1) and the head tips by `yawn_pitch`.
+    /// `yawn_pitch` is signed; negative is up, as far as `robot.look` says.
+    pub yawn_after_s: f64,
+    pub yawn_every_s: f64,
+    pub yawn_s: f64,
+    pub yawn_open: f64,
+    pub yawn_pitch: f64,
+}
+
+impl Default for IdleParams {
+    fn default() -> Self {
+        Self {
+            enabled: None,
+            after_s: 2.0,
+            fade_s: 1.5,
+            glance_yaw: 0.6,
+            glance_pitch: 0.2,
+            glance_neck: 0.15,
+            glance_mouth: 0.4,
+            tilt_roll: 0.3,
+            tilt_chance: 0.25,
+            centre_chance: 0.25,
+            glance_min: 0.2,
+            hold_min_s: 1.0,
+            hold_max_s: 3.0,
+            move_min_s: 0.3,
+            move_s_per_rad: 1.0,
+            nudge_yaw: 0.08,
+            nudge_pitch: 0.05,
+            nudge_every_min_s: 0.4,
+            nudge_every_max_s: 1.2,
+            drift: 0.04,
+            drift_hz: 0.15,
+            breath_m: 0.001,
+            breath_period_s: 3.6,
+            doze_tau_s: 90.0,
+            doze_floor: 0.5,
+            yawn_after_s: 45.0,
+            yawn_every_s: 90.0,
+            yawn_s: 3.0,
+            yawn_open: 0.6,
+            yawn_pitch: -0.15,
+        }
+    }
+}
+
+impl IdleParams {
+    /// Whether the look-around runs in `mode`.
+    ///
+    /// Off for the roller unless asked for, because what it moves is the head *command*, and the
+    /// head command is an observation input (`duck_control::obs`, 51..55), not a target added on
+    /// top. `roller.onnx` was not trained with one moving, and folds under it: the robot collapsed
+    /// about three seconds after the stick was let go — the 2 s delay plus the fade-in. Walking
+    /// keeps it on, as it always had it.
+    pub fn enabled_in(&self, mode: Mode) -> bool {
+        self.enabled.unwrap_or(mode == Mode::Walk)
+    }
+
+    /// What is wrong with these values, if anything, as (key, reason).
+    fn invalid(&self) -> Option<(&'static str, &'static str)> {
+        let finite = [
+            ("after_s", self.after_s),
+            ("fade_s", self.fade_s),
+            ("glance_yaw", self.glance_yaw),
+            ("glance_pitch", self.glance_pitch),
+            ("glance_neck", self.glance_neck),
+            ("glance_mouth", self.glance_mouth),
+            ("tilt_roll", self.tilt_roll),
+            ("tilt_chance", self.tilt_chance),
+            ("centre_chance", self.centre_chance),
+            ("glance_min", self.glance_min),
+            ("hold_min_s", self.hold_min_s),
+            ("hold_max_s", self.hold_max_s),
+            ("move_min_s", self.move_min_s),
+            ("move_s_per_rad", self.move_s_per_rad),
+            ("nudge_yaw", self.nudge_yaw),
+            ("nudge_pitch", self.nudge_pitch),
+            ("nudge_every_min_s", self.nudge_every_min_s),
+            ("nudge_every_max_s", self.nudge_every_max_s),
+            ("drift", self.drift),
+            ("drift_hz", self.drift_hz),
+            ("breath_m", self.breath_m),
+            ("breath_period_s", self.breath_period_s),
+            ("doze_tau_s", self.doze_tau_s),
+            ("doze_floor", self.doze_floor),
+            ("yawn_after_s", self.yawn_after_s),
+            ("yawn_every_s", self.yawn_every_s),
+            ("yawn_s", self.yawn_s),
+            ("yawn_open", self.yawn_open),
+        ];
+        if let Some((key, _)) = finite.iter().find(|(_, v)| !(v.is_finite() && *v >= 0.0)) {
+            return Some((key, "must be finite and nonnegative"));
+        }
+        if !self.yawn_pitch.is_finite() {
+            return Some(("yawn_pitch", "must be finite"));
+        }
+        // Each of these is divided by, or is what keeps a tick's motion from being a jump.
+        for (key, value) in [
+            ("fade_s", self.fade_s),
+            ("move_min_s", self.move_min_s),
+            ("breath_period_s", self.breath_period_s),
+            ("doze_tau_s", self.doze_tau_s),
+            ("doze_floor", self.doze_floor),
+            ("yawn_s", self.yawn_s),
+        ] {
+            if value == 0.0 {
+                return Some((key, "must be above zero"));
+            }
+        }
+        if self.tilt_chance > 1.0 {
+            return Some(("tilt_chance", "is a probability, 0 to 1"));
+        }
+        if self.centre_chance > 1.0 {
+            return Some(("centre_chance", "is a probability, 0 to 1"));
+        }
+        if self.doze_floor > 1.0 {
+            return Some(("doze_floor", "must be at most 1 — 1 never dozes"));
+        }
+        if self.glance_mouth > 1.0 {
+            return Some(("glance_mouth", "is a mouth opening, 0 to 1"));
+        }
+        if self.yawn_open > 1.0 {
+            return Some(("yawn_open", "is a mouth opening, 0 to 1"));
+        }
+        if self.hold_min_s > self.hold_max_s {
+            return Some(("hold_min_s", "must not be above idle.hold_max_s"));
+        }
+        if self.nudge_every_min_s > self.nudge_every_max_s {
+            return Some((
+                "nudge_every_min_s",
+                "must not be above idle.nudge_every_max_s",
+            ));
+        }
+        None
+    }
+}
+
 /// `[theremin]` — the ToF theremin: what counts as a hand, and where the depth frames come
 /// from.
 ///
@@ -353,9 +1236,10 @@ pub struct ChoraleParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ThereminParams {
-    /// Master switch. On by default: the instrument still has to be picked up with
-    /// `robot.theremin`, so what this turns off is the *ability* to, on a duck where the
-    /// feature is unwanted or the sensor is known bad.
+    /// Master switch. **Off by default**: the theremin is a party trick, and a duck that
+    /// nobody asked to play one should not be reaching for the depth stream at all. Turning
+    /// it on grants the *ability* to pick the instrument up — that still takes
+    /// `robot.theremin` — on a duck where somebody wants it and the ToF is known good.
     pub enabled: bool,
     /// `tofd`'s depth stream.
     pub socket: PathBuf,
@@ -377,13 +1261,198 @@ impl Default for ThereminParams {
     fn default() -> Self {
         let hand = kinematics::hand::Config::default();
         Self {
-            enabled: true,
+            enabled: false,
             socket: PathBuf::from(duck_ipc_proto::socket::TOF),
             near_m: hand.near_m,
             far_m: hand.far_m,
             min_zones: hand.min_zones,
             statuses: hand.statuses,
             hold_ms: hand.hold.as_millis() as u64,
+        }
+    }
+}
+
+/// `[laser]` — laser tracking: a red laser dot on the floor is followed with the head and walked to.
+///
+/// Switched with `robotctl laser-track on|off` (`robot.laserTrack`), which does not write this
+/// file; `enabled` is whether it starts switched on. **Every key here applies live** — `robotd`
+/// re-reads this section within a second of the file changing, switches tracking if `enabled`
+/// moved, and hands the detection half to `mediad` by resubscribing — because tuning it means
+/// pointing a laser, reading `robotctl laser-track`, and changing a number, many times over, and a
+/// restart each time would drop the robot.
+///
+/// The camera keeps streaming exactly as it does without this: `mediad` scans the frames the tee
+/// already has at the stream's own auto-exposure, and nothing about the sensor changes. That is
+/// why the thresholds are here. A dot at normal exposure is a white core with a red rim, and the
+/// right numbers depend on the room and the laser.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct LaserParams {
+    /// Tracking is on from boot, and editing it switches tracking live. Off by default: the camera
+    /// is scanned for as long as tracking is on.
+    pub enabled: bool,
+    /// `mediad`'s local socket, where `media.laser` is served.
+    pub socket: PathBuf,
+    /// Luma a dot pixel must reach, 0–255.
+    pub y_min: u8,
+    /// Red chroma (V / Cr) a dot pixel must reach, 0–255; 128 is grey.
+    pub v_min: u8,
+    /// Blue chroma (U / Cb) a dot pixel must stay below, 0–255; 128 is grey.
+    pub u_max: u8,
+    /// Fewest sampled pixels that make a dot.
+    pub min_pixels: u32,
+    /// Most sampled pixels that are still a dot rather than something red and lit.
+    pub max_pixels: u32,
+    /// How far from the brightest hit still belongs to the dot, pixels of the full frame.
+    pub radius_px: u32,
+    /// Looks per second while nothing is in sight.
+    pub search_hz: f64,
+    /// Looks per second while following a dot.
+    pub track_hz: f64,
+    /// Point the head at the dot.
+    pub head: bool,
+    /// Walk to the dot.
+    pub walk: bool,
+    /// How long a dot that went out of sight is still followed, milliseconds.
+    pub memory_ms: u64,
+    /// Stop walking this close to the dot, metres — measured from the trunk, so this is about
+    /// where the beak ends up over it.
+    pub stop_m: f64,
+    /// Ignore a dot projected farther than this, metres. Far along a shallow ray, a pixel of
+    /// error is a lot of floor.
+    pub max_range_m: f64,
+    /// Forward speed per metre of distance left, 1/s.
+    pub k_dist: f64,
+    /// Turn rate per radian of bearing to the dot, 1/s.
+    pub k_yaw: f64,
+    /// Fastest forward speed, m/s.
+    pub vx_max: f64,
+    /// Fastest turn, rad/s.
+    pub vyaw_max: f64,
+    /// Added to the floor's height under the trunk, metres. Positive raises the floor, so dots
+    /// project nearer. For when `robotctl laser-track` reports a distance that is consistently off.
+    pub floor_offset_m: f64,
+}
+
+impl Default for LaserParams {
+    fn default() -> Self {
+        let detect = duck_ipc_proto::LaserDetectParams::default();
+        Self {
+            enabled: false,
+            socket: PathBuf::from(duck_ipc_proto::socket::MEDIA),
+            y_min: detect.y_min,
+            v_min: detect.v_min,
+            u_max: detect.u_max,
+            min_pixels: detect.min_pixels,
+            max_pixels: detect.max_pixels,
+            radius_px: detect.radius_px,
+            search_hz: detect.search_hz,
+            track_hz: detect.track_hz,
+            head: true,
+            walk: true,
+            memory_ms: 1000,
+            stop_m: 0.25,
+            max_range_m: 2.5,
+            k_dist: 1.0,
+            k_yaw: 1.5,
+            vx_max: 0.25,
+            vyaw_max: 0.8,
+            floor_offset_m: 0.0,
+        }
+    }
+}
+
+impl LaserParams {
+    /// The half of this section `mediad` needs, as the wire carries it.
+    pub fn detect(&self) -> duck_ipc_proto::LaserDetectParams {
+        duck_ipc_proto::LaserDetectParams {
+            y_min: self.y_min,
+            v_min: self.v_min,
+            u_max: self.u_max,
+            min_pixels: self.min_pixels,
+            max_pixels: self.max_pixels,
+            radius_px: self.radius_px,
+            search_hz: self.search_hz,
+            track_hz: self.track_hz,
+        }
+    }
+
+    fn check(&self) -> Option<(&'static str, &'static str)> {
+        let positive = |v: f64| v.is_finite() && v > 0.0;
+        if !positive(self.search_hz) || self.search_hz > 30.0 {
+            return Some(("search_hz", "must be above 0 and at most 30"));
+        }
+        if !positive(self.track_hz) || self.track_hz > 30.0 {
+            return Some(("track_hz", "must be above 0 and at most 30"));
+        }
+        if self.min_pixels == 0 || self.max_pixels < self.min_pixels {
+            return Some((
+                "max_pixels",
+                "must be at least min_pixels, and min_pixels at least 1",
+            ));
+        }
+        if self.radius_px == 0 {
+            return Some(("radius_px", "must be at least 1"));
+        }
+        for (key, v) in [
+            ("stop_m", self.stop_m),
+            ("max_range_m", self.max_range_m),
+            ("k_dist", self.k_dist),
+            ("k_yaw", self.k_yaw),
+            ("vx_max", self.vx_max),
+            ("vyaw_max", self.vyaw_max),
+        ] {
+            if !(v.is_finite() && v >= 0.0) {
+                return Some((key, "must be zero or positive"));
+            }
+        }
+        if !self.floor_offset_m.is_finite() || self.floor_offset_m.abs() > 0.2 {
+            return Some(("floor_offset_m", "must be within ±0.2 m"));
+        }
+        None
+    }
+}
+
+/// `[pickup]`: pause the policy while somebody holds the robot, resume when it is put down.
+///
+/// A classifier over the last second of what the loop already reads (`duck_control::pickup`,
+/// `docs/design/robotd-design.md` §2.4.2). **On by default** since the v2 model held up on the
+/// robot in every way it was handled (lifted by the body or the head, turned upside down, spun).
+/// Turned off, nothing is loaded and nothing runs — the loop is exactly what it was.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PickupParams {
+    /// Master switch.
+    pub enabled: bool,
+    /// The classifier. Absent means the release's copy; the literal `"none"` disables it.
+    pub model: Option<PathBuf>,
+    /// Pause once p(held) has stayed above this for 100 ms.
+    pub pause_threshold: f32,
+    /// Resume once p(held) has stayed below this for 80 ms (and the pause is 300 ms old).
+    /// Higher resumes sooner after a put-down — which is what keeps a paused robot, holding a
+    /// fixed pose, from tipping before the policy has it back — at the price of more false
+    /// resumes in the hand.
+    pub resume_threshold: f32,
+}
+
+impl Default for PickupParams {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            model: None,
+            pause_threshold: 0.8,
+            resume_threshold: 0.35,
+        }
+    }
+}
+
+impl PickupParams {
+    /// The classifier path, or `None` when disabled with the `"none"` sentinel.
+    pub fn model_resolved(&self) -> Option<PathBuf> {
+        match &self.model {
+            Some(p) if is_none_sentinel(p) => None,
+            Some(p) => Some(p.clone()),
+            None => Some(PathBuf::from(RELEASE_DIR).join("models/pickup_detector.onnx")),
         }
     }
 }
@@ -401,6 +1470,77 @@ impl ThereminParams {
     }
 }
 
+/// `[head_imu]` — the IMU in the robot's head, served as `head_imu.stream`. Which chip, and
+/// which daemon reads it, is the board's:
+///
+/// - **`zero3`**: the BMI088 on the HAT, read by `tofd` (it shares the HAT's I²C bus with the
+///   ToF) with a Madgwick fusion on the CPU. Reading it at 100 Hz costs ~3.5–4.5% of a core on
+///   an RK3566, and a bench that isolates the parts says none of it is fixable in the loop:
+///   being woken a hundred times a second is 0.7 points of it, the fusion 0.3, and the rest is
+///   the two I²C transactions a sample takes. So it is **off** unless asked for —
+///   `docs/project/tof-on-demand.md` is the measurement and the reasoning.
+/// - **`beta`**: an LSM6DSV16X on the face board's own bus, read by `robotd`. The chip fuses
+///   orientation itself (SFLP) and batches gyro, accelerometer and quaternion into its FIFO,
+///   so a burst of several samples is one transaction and there is no fusion on the CPU. That
+///   removes what made the BMI088 expensive, so it is **on** unless switched off.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct HeadImuParams {
+    /// Read the head IMU at all. Absent means the board's default ([`Self::enabled_on`]):
+    /// off on `zero3`, on on `beta`. `tofd --imu` overrides it for a session on `zero3`.
+    pub enabled: Option<bool>,
+}
+
+impl HeadImuParams {
+    /// Whether the head IMU is read on `board`: the file's word if it has one, otherwise the
+    /// board's default — off for the BMI088 a `zero3` reads on the CPU, on for the `beta`'s
+    /// self-fusing LSM6DSV16X.
+    pub fn enabled_on(&self, board: board::Board) -> bool {
+        self.enabled.unwrap_or(board.is_beta_main_board())
+    }
+
+    /// The daemon that reads the head IMU on `board`, and so the one to restart when this
+    /// section changes.
+    pub fn reader(board: board::Board) -> &'static str {
+        if board.is_beta_main_board() {
+            "robotd"
+        } else {
+            "tofd"
+        }
+    }
+}
+
+#[cfg(test)]
+mod head_imu_tests {
+    use super::*;
+    use board::Board;
+
+    /// Off on `zero3`, where reading the BMI088 costs ~4% of a core on the CPU; on on `beta`,
+    /// where the chip fuses and batches itself. An explicit word in the file wins on both.
+    #[test]
+    fn the_default_is_the_boards_and_the_file_wins() {
+        let unset = HeadImuParams::default();
+        assert!(!unset.enabled_on(Board::Zero3));
+        assert!(unset.enabled_on(Board::Beta));
+        assert!(unset.enabled_on(Board::FaceBoardV1));
+        let off = HeadImuParams {
+            enabled: Some(false),
+        };
+        assert!(!off.enabled_on(Board::Beta));
+        let on = HeadImuParams {
+            enabled: Some(true),
+        };
+        assert!(on.enabled_on(Board::Zero3));
+    }
+
+    #[test]
+    fn each_board_names_the_daemon_that_reads_it() {
+        assert_eq!(HeadImuParams::reader(Board::Zero3), "tofd");
+        assert_eq!(HeadImuParams::reader(Board::Beta), "robotd");
+        assert_eq!(HeadImuParams::reader(Board::FaceBoardV1), "robotd");
+    }
+}
+
 /// `[audio]` — the voice and the microphone. All optional equipment: a robot without a
 /// codec (or a bank) walks identically and stays quiet, so nothing here reaches a health
 /// verdict.
@@ -409,7 +1549,8 @@ impl ThereminParams {
 pub struct AudioParams {
     /// Master switch: no sounds, no mic worker.
     pub enabled: bool,
-    /// ALSA playback device — the TLV320AIC3104 codec.
+    /// ALSA playback device — the TLV320AIC3104 codec. When it names a card this board does
+    /// not have, [`AudioParams::resolve_devices`] falls back to ALSA's `default`.
     pub device: String,
     /// Where the per-robot voice bank lives. The release's postinstall renders it there
     /// (`sounds ensure-bank`), seeded from the SoC serial.
@@ -468,12 +1609,58 @@ impl AudioParams {
         }
     }
 
+    /// The playback and capture devices to use on a board whose ALSA cards are `cards` (the
+    /// ids in `/proc/asound/cards`, see [`alsa_card_ids`]).
+    ///
+    /// The configured device, unless it names a card that is not there — then ALSA's
+    /// `default` for both. The default device names the Zero 3W's HAT codec (`aic3104`), and a
+    /// board without it used to be silent and deaf with nothing in the journal above debug,
+    /// even when it has a perfectly good codec of its own. With the fallback, a board routes
+    /// `default` through its own ALSA configuration — the beta board's image points it at its
+    /// RK809 for playback and its face-board microphone for capture, two different cards,
+    /// which is why capture falls back to `default` too rather than to `default,0`.
+    ///
+    /// A device that names no card (`default`, a PCM from an asound.conf, a numeric card) is
+    /// used as written: there is nothing to check it against.
+    pub fn resolve_devices(&self, cards: &[String]) -> ResolvedAudio {
+        match named_card(&self.device) {
+            Some(card) if !cards.iter().any(|c| c == card) => ResolvedAudio {
+                playback: "default".to_owned(),
+                capture: "default".to_owned(),
+                missing_card: Some(card.to_owned()),
+            },
+            _ => ResolvedAudio {
+                playback: self.device.clone(),
+                capture: self.capture_device(),
+                missing_card: None,
+            },
+        }
+    }
+
     /// The classifier path, or `None` when disabled with the `"none"` sentinel.
     pub fn pet_model_resolved(&self) -> Option<PathBuf> {
         match &self.pet_model {
             Some(p) if is_none_sentinel(p) => None,
             Some(p) => Some(p.clone()),
             None => Some(PathBuf::from(RELEASE_DIR).join("models/pet_detect.onnx")),
+        }
+    }
+}
+
+/// `[emotions]` — the robot's own emotions, `<name>.json` keyframes and `<name>.wav` beside them,
+/// read once at startup on top of the set the release ships (`emotions/` in [`RELEASE_DIR`]): a
+/// file here adds one or replaces the shipped one of the same name. A directory that is not there
+/// is a robot with only the shipped set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct EmotionsParams {
+    pub dir: PathBuf,
+}
+
+impl Default for EmotionsParams {
+    fn default() -> Self {
+        Self {
+            dir: PathBuf::from("/var/lib/robot/emotions"),
         }
     }
 }
@@ -527,8 +1714,8 @@ pub struct PolicyParams {
     pub walk: Option<PathBuf>,
     /// Standing policy. Without one the walking policy runs at every velocity.
     pub stand: Option<PathBuf>,
-    /// Commanded sit↔stand (posture flag in the twist `vx` slot). Sit toggle, shutdown sit
-    /// and the seated-boot rise all need it.
+    /// Commanded sit↔stand (posture flag in the twist `vx` slot). Sit toggle and the shutdown
+    /// sit both need it.
     pub sitstand: Option<PathBuf>,
     /// Phase-scripted ground pick. In roller mode this slot holds the crouch.
     pub ground_pick: Option<PathBuf>,
@@ -555,35 +1742,576 @@ pub struct PolicyParams {
     pub head_lowpass: Option<f64>,
     /// Same, for the ten leg joints. Walking default 0.7.
     pub legs_lowpass: Option<f64>,
-    /// One ground-pick cycle, seconds. The move ends at 70% of the cycle, as the prototype
-    /// does. Absent resolves per mode: 4.0 walking, 3.0 roller (the crouch).
+    /// One ground-pick cycle, seconds. The move ends at the set's `end_phase` (70% of the
+    /// cycle, as the prototype does). Absent resolves from the installed set's phase-encoded
+    /// entry for this mode, else 4.0 walking, 3.0 roller (the crouch).
     pub ground_pick_period: Option<f64>,
-    /// Action scale while the ground pick runs. Absent: 1.0 walking, 0.8 roller.
+    /// Action scale while the ground pick runs. Absent: the set's entry, else 1.0 walking,
+    /// 0.8 roller.
     pub ground_pick_action_scale: Option<f64>,
     /// Gain multiplier while the ground pick runs.
     pub ground_pick_gain_ratio: f64,
-    /// How long a kick window stays on the kick network, seconds.
-    pub kick_duration: f64,
-    /// One roulade — one forward roll, seconds. Holding the button chains rolls; this is
-    /// the length of each. The prototype's measured single-roll time.
-    pub roulade_duration: f64,
-    /// Action scale while a roulade runs.
-    pub roulade_action_scale: f64,
-    /// Gain multiplier while a roulade runs.
-    pub roulade_gain_ratio: f64,
+    /// How fast the smoothed twist may change, per axis: m/s² forward/back and sideways, rad/s²
+    /// in yaw. Applied after `[control] cmd_alpha`, so a small stick move is the EMA it always
+    /// was and only a large one — full forward to full back — becomes a ramp at this slope. An
+    /// EMA alone moves fastest exactly then, its rate being proportional to the jump.
+    ///
+    /// Absent resolves per mode: no limit walking; the roller limits `vx` to 1.0 and leaves
+    /// `vy` and `vyaw` free. `0` is no limit.
+    pub accel_vx: Option<f64>,
+    pub accel_vy: Option<f64>,
+    pub accel_vyaw: Option<f64>,
+    /// The one-shot skills this robot has, in priority order.
+    ///
+    /// Empty means the built-in three — kicks and roulade, with the numbers they have always
+    /// had — so a board that updates onto this keeps working with nothing written. An entry
+    /// merges by name: naming `roulade` changes that one, naming anything else adds a skill.
+    /// The file stays a list of decisions rather than a copy of the defaults, which is what
+    /// `robotctl configure` promises about every other key here.
+    #[serde(default, rename = "skill", skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<SkillDef>,
     /// Scale actions with battery voltage: effective scale × (nominal / measured). The
     /// servos' effective kP tracks their supply, so this holds the robot's response steady
-    /// as the pack sags. Off by default, as in the prototype.
+    /// as the pack sags. On by default since 2026-09-14 (the prototype ran without it).
     pub voltage_adapt: bool,
     /// Reference voltage for `voltage_adapt` — the 2S pack both variants run from.
     /// Unset is 7.4 V (OpenMicroDuck HD1910 and MicroDuck XL330). BAM identified the
     /// HD1910 at `vin=6.0`; that is a model condition, not this default.
     pub nominal_voltage: Option<f64>,
+    /// Whether `policy.fetch` may download a policy from a Hub repo outside `pollen-robotics`.
+    ///
+    /// Off by default: a robot out of the box only fetches networks we published. It gates the
+    /// download and nothing else — a slot already pointing at a community policy keeps running
+    /// when this is turned off, so flipping it can never change what a robot does at its next
+    /// start. `robotd` does not read it; `updaterd` does, before every fetch
+    /// ([`Self::community_allowed`]). `docs/design/policy-channel-design.md` §9.2.
+    pub allow_community: bool,
 }
 
 /// The literal that disables an optional policy slot, per the prototype's `--x-policy None`.
-fn is_none_sentinel(path: &std::path::Path) -> bool {
+///
+/// Public because three places need to agree on it: this crate resolving config, `robotctl`
+/// accepting `policy load <slot> none`, and `robotd` recognising it on the wire. A second spelling
+/// of it somewhere would be a slot that looks disabled in a file and is not.
+pub fn is_none_sentinel(path: &std::path::Path) -> bool {
     path.as_os_str().eq_ignore_ascii_case("none")
+}
+
+/// A one-shot skill: a network, how long it drives, and what it changes while it does.
+///
+/// **The thing this replaces was three hardcoded arms that differed in four numbers.** Kicks and
+/// roulade wrote the same all-zero command into the same kind of window; they differed in
+/// duration, action scale, gain ratio, and whether holding the button chained another. A
+/// community policy like `polite-bow` — zero command, four seconds, selecting it is the trigger —
+/// is a fifth set of the same four numbers, and could not be added without a daemon release.
+///
+/// Deliberately *only* the zero-command family. `walk` and `stand` are the fallback pair chosen
+/// by command magnitude, `sitstand` is latched and driven internally by the shutdown sit, and `ground_pick` writes a scripted phase rather than a constant. Those stay
+/// where they are until something needs them not to; see `docs/ideas/policy-moves.md`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillDef {
+    /// What a client asks for — `robot.do {skill: "roulade"}` — and what a pad button binds to.
+    pub name: String,
+
+    /// The `.onnx`. Absent means this robot's own copy, by convention `<name>.onnx` in the
+    /// policy directory, so a built-in needs no path and a fetched one carries the path
+    /// `robotctl policy load` wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+
+    /// Seconds the network drives before handing back to walk or stand — or, when `unwind_s`
+    /// is set, before it starts coming back.
+    pub duration: f64,
+
+    /// The twist this skill's network is fed while it runs.
+    ///
+    /// Zeros for most of them, which is what a policy trained with `zero_command_padding`
+    /// expects and what made kicks, roulade and `polite-bow` the same arm. A non-zero constant
+    /// is how a policy with its own command encoding becomes a one-shot: the published flamingo
+    /// reads `[flag, side, 0]`, so `[1, 1, 0]` is "lift the left leg".
+    ///
+    /// Head and body stay zeroed either way. Every one-shot published so far declares them
+    /// unused, and a skill that wanted them live would be a different shape than this.
+    #[serde(default)]
+    pub command: [f64; 3],
+
+    /// The twist fed for `unwind_s` after the window, before handing back.
+    ///
+    /// **This is what lets a policy with no ending of its own be a one-shot.** An episodic
+    /// policy returns itself to a safe pose — `polite-bow` is standing again after its four
+    /// seconds — so handing straight back to walk is fine. A perpetual one does not: it holds
+    /// until told otherwise, and handing back mid-hold gives walk a robot balanced on one foot.
+    /// Driving the idle command for a moment first is the daemon supplying the ending the policy
+    /// does not have, which is exactly what the sit toggle already does on its way up.
+    #[serde(default)]
+    pub unwind: [f64; 3],
+
+    /// Seconds spent on `unwind` before handing back. Zero — the default — means the policy ends
+    /// itself and the window simply expires.
+    #[serde(default)]
+    pub unwind_s: f64,
+
+    /// Whether a request arriving while it runs starts another when this one finishes — how a
+    /// client maps "the button is held" onto a one-shot. Roulade does; a kick does not.
+    #[serde(default)]
+    pub chain: bool,
+
+    /// What this skill changes about the robot while it runs, and only while it runs.
+    #[serde(default)]
+    pub params: SkillOverrides,
+}
+
+/// Parameters a skill changes for its duration, restored when it ends.
+///
+/// **Raw parameter names, not a vocabulary of our own.** `cmd_alpha` rather than an invented
+/// `smoothing = "off"`: one set of names for a person to learn, and `robotctl configure` already
+/// documents every one of them.
+///
+/// **No fall-gate override here either, and for a sharper reason: a running skill already has
+/// the fall reflex switched off.** The limp-fall predictor is only consulted while the
+/// controller is not `busy()`, and any active skill makes it busy — so a move that leans past
+/// the gate cannot trip it, and a field to raise the gate would have been decoration. What that
+/// *does* mean is that the reflex is off for the whole of a skill, which was uncontroversial for
+/// a half-second kick and is worth a second look for anything long.
+///
+/// **No `cmd_alpha` here, and its absence is the point.** Smoothing is applied to the *client's*
+/// command on its way in, and a skill never reads that: the loop builds a fresh command block
+/// from `command` or `unwind` and feeds it straight to the network. So a skill's twist is
+/// unsmoothed by construction — which is exactly what a policy reading a flag rather than a
+/// velocity needs, and the reason driving one through `robot.move` into the walk slot needed
+/// `cmd_alpha = 1.0` set globally and remembered afterwards.
+///
+/// **A named set rather than "any key".** A skill that could widen a joint limit or lengthen the
+/// deadman would be reaching past the layer that makes a stranger's policy safe to try at all —
+/// which is the entire argument for allowing one on the robot. Everything here is tuning or a
+/// threshold that a *move* legitimately owns for its own duration.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SkillOverrides {
+    /// Scales raw policy output into a joint offset, as `[policy] action_scale` does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_scale: Option<f64>,
+
+    /// Multiplier on the running gain, so a move can be softer or stiffer than the gait.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gain_ratio: Option<f64>,
+}
+
+impl SkillDef {
+    /// The file this skill runs, resolved the way every other policy path resolves.
+    pub fn resolved_path(&self) -> Option<PathBuf> {
+        match &self.path {
+            Some(p) if is_none_sentinel(p) => None,
+            Some(p) => Some(p.clone()),
+            None => Some(PathBuf::from(POLICY_DIR).join(format!("{}.onnx", self.name))),
+        }
+    }
+}
+
+/// What the official policy set says about itself, installed beside the `.onnx` files.
+///
+/// The set is fetched from the Hub and versioned there, so what it contains — and how long each
+/// one-shot runs — is a property of the set rather than of this build. Without this, adding a
+/// tenth policy to the set meant a daemon release: one edit to the seeder's download list so it
+/// arrives, and another here so it is a skill. That is the same coupling this whole exercise
+/// removed for a stranger's policy, still in place for our own.
+///
+/// Absent is normal and not an error: a board seeded before the set carried one, or one where
+/// the fetch has not happened yet. The three built-ins below are the fallback.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct SetManifest {
+    pub policies: Vec<SetPolicy>,
+}
+
+/// One policy in the official set.
+///
+/// **The same field names a single-policy repo uses**, plus `file` to say which `.onnx` it
+/// describes. That is deliberate: the community convention is one repo per policy with a flat
+/// manifest, and the official set is nine policies in one repo. Sharing the vocabulary means
+/// asking a publisher to *add fields*, not to adopt a second format, and it means one reader
+/// understands both.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct SetPolicy {
+    /// The `.onnx`, as it is named in the repo and on disk. The only field a standalone manifest
+    /// has no use for, since a repo with one policy has nothing to disambiguate.
+    pub file: String,
+    /// What a client asks for, when this is a one-shot. Absent means the file's stem, so
+    /// `roulade.onnx` needs no name while `ball_kick_left.onnx` says `kick_left` — the names are
+    /// roles and the files are training runs, an indirection worth keeping.
+    pub name: Option<String>,
+    /// `"episodic"`, `"perpetual"` or `"scripted"`, and the difference is who supplies the
+    /// ending.
+    ///
+    /// An episodic policy runs for `duration_s` and returns itself to a safe pose. On a constant
+    /// command it is a skill on its own; on a phase command (`command.encoding = "phase"`) it is
+    /// the ground pick — the daemon writes the phase, and the numbers here are how fast. A
+    /// perpetual one has no length of its own — how long to hold a foot up is a person's choice,
+    /// so it takes a config entry rather than appearing. A scripted one is episodic but
+    /// interruptible: the daemon drives it through a command it can change mid-flight, which is
+    /// what the sit↔stand posture flag is.
+    pub kind: Option<String>,
+    /// Seconds it runs, for a policy that ends itself. For a phase policy this is
+    /// `period_s × end_phase`, recorded so a reader need not multiply.
+    pub duration_s: Option<f64>,
+    /// Whether a request arriving while it runs starts another when this one finishes — how a
+    /// client maps "the button is held" onto a one-shot.
+    pub chain: bool,
+    /// Scales raw output into a joint offset, when this policy wants its own.
+    pub action_scale: Option<f64>,
+    /// Seconds a perpetual policy needs to get back to its idle command — or, for the sit↔stand,
+    /// how long the rise on posture flag 0 gets before the gait takes over.
+    pub unwind_s: Option<f64>,
+    /// Seconds the network takes to reach its commanded posture after the flag flips. The
+    /// sit↔stand is trained on a 2 s slewed target, so the seat is a ~2 s glide; the shutdown sit
+    /// waits twice that before cutting torque.
+    pub ramp_s: Option<f64>,
+    /// Which drive mode this policy belongs to. Absent means walking. The roller crouch is the
+    /// ground pick of `"roller"` mode, and the two must not be confused with each other.
+    pub mode: Option<Mode>,
+    /// The command block: how the daemon is meant to drive this network.
+    pub command: Option<SetCommand>,
+}
+
+/// The machine-readable half of a manifest's command block.
+///
+/// Three encodings exist in the set, and `encoding` names which one this is:
+///
+/// - absent or `"constant"`: the skill family — a fixed twist for the window, `idle` on the way
+///   back. Every kick, the roulade, and every community one-shot so far.
+/// - `"phase"`: `[cos 2πφ, sin 2πφ, 0]` with φ advancing from 0 over `period_s` seconds and the
+///   move handing back at `end_phase`. The ground pick, and the roller crouch.
+/// - `"posture_flag"`: one slot carries `sit` or `stand`. The sit↔stand.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct SetCommand {
+    pub encoding: Option<String>,
+    /// The twist that means "stop doing the thing".
+    pub idle: Option<[f64; 3]>,
+    /// Phase encoding: seconds per full cycle.
+    pub period_s: Option<f64>,
+    /// Phase encoding: the fraction of the cycle at which the move hands back. The pick's rise
+    /// is over well before 1.0, and running to 1.0 replays the reach on the way out.
+    pub end_phase: Option<f64>,
+    /// Posture flag: the value that means "sit".
+    pub sit: Option<f64>,
+    /// Posture flag: the value that means "stand".
+    pub stand: Option<f64>,
+}
+
+/// The ground pick's cycle: what a phase-encoded set entry declares.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PhaseTiming {
+    /// Seconds per full cycle.
+    pub period_s: f64,
+    /// Fraction of the cycle at which the move hands back.
+    pub end_phase: f64,
+    /// Action scale while it runs, if the entry says.
+    pub action_scale: Option<f64>,
+}
+
+/// The sit↔stand's timing: what the scripted set entry declares.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SitStandTiming {
+    /// Seconds the rise runs on the sitstand network before the gait takes over.
+    pub rise_s: f64,
+    /// Seconds the seat takes to settle after the flag flips.
+    pub ramp_s: f64,
+}
+
+impl SetPolicy {
+    pub fn skill_name(&self) -> String {
+        self.name.clone().unwrap_or_else(|| {
+            std::path::Path::new(&self.file)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| self.file.clone())
+        })
+    }
+
+    pub fn is_episodic(&self) -> bool {
+        self.kind.as_deref() == Some("episodic")
+    }
+
+    pub fn is_scripted(&self) -> bool {
+        self.kind.as_deref() == Some("scripted")
+    }
+
+    fn encoding(&self) -> Option<&str> {
+        self.command.as_ref().and_then(|c| c.encoding.as_deref())
+    }
+
+    /// The daemon writes this policy's command as a phase. A `period_s` with no `encoding` is
+    /// taken the same way — the field has no other meaning.
+    pub fn is_phase(&self) -> bool {
+        self.encoding() == Some("phase")
+            || self.command.as_ref().is_some_and(|c| c.period_s.is_some())
+    }
+
+    /// The daemon writes this policy's command as a posture flag.
+    pub fn is_posture_flag(&self) -> bool {
+        self.encoding() == Some("posture_flag")
+    }
+
+    /// The mode this policy belongs to; absent means walking.
+    pub fn mode(&self) -> Mode {
+        self.mode.unwrap_or_default()
+    }
+
+    /// **An episodic policy on a constant command**: what becomes a skill on its own.
+    ///
+    /// A phase-encoded one does not — it is the ground pick, whose command the daemon generates,
+    /// and loading it as a generic one-shot would feed it all-zeros: a robot moving plausibly and
+    /// wrongly, which `duck_control::obs`'s header calls the hardest failure to see.
+    pub fn is_zero_command_skill(&self) -> bool {
+        self.is_episodic() && !self.is_phase() && !self.is_posture_flag()
+    }
+
+    /// The phase timing, for an episodic policy the daemon drives through a phase.
+    pub fn phase_timing(&self) -> Option<PhaseTiming> {
+        if !self.is_episodic() || !self.is_phase() {
+            return None;
+        }
+        let command = self.command.as_ref()?;
+        Some(PhaseTiming {
+            period_s: command.period_s?,
+            end_phase: command.end_phase.unwrap_or(DEFAULT_GROUND_PICK_END_PHASE),
+            action_scale: self.action_scale,
+        })
+    }
+
+    /// The sit↔stand timing, for the scripted posture-flag policy.
+    pub fn sitstand_timing(&self) -> Option<SitStandTiming> {
+        if !self.is_scripted() || !self.is_posture_flag() {
+            return None;
+        }
+        Some(SitStandTiming {
+            rise_s: self.unwind_s.unwrap_or(DEFAULT_SITSTAND_RISE_S),
+            ramp_s: self.ramp_s.unwrap_or(DEFAULT_SITSTAND_RAMP_S),
+        })
+    }
+}
+
+impl SetManifest {
+    /// The ground pick of one mode, if the set declares it: the phase-encoded episodic entry
+    /// tagged with that mode (walking when untagged). The first one wins, and a set that lists
+    /// two for the same mode has made a mistake this cannot see.
+    pub fn ground_pick(&self, mode: Mode) -> Option<PhaseTiming> {
+        self.policies
+            .iter()
+            .filter(|p| p.mode() == mode)
+            .find_map(|p| p.phase_timing())
+    }
+
+    /// The sit↔stand's timing, if the set declares it. The sitstand is mode-independent — both
+    /// presets load the same network — so the first scripted posture-flag entry is it.
+    pub fn sitstand(&self) -> Option<SitStandTiming> {
+        self.policies.iter().find_map(|p| p.sitstand_timing())
+    }
+
+    /// The entries that are skills on their own: episodic, constant-command, and not named as
+    /// something the daemon drives itself.
+    ///
+    /// **A set cannot claim a name the daemon drives itself.** The ground pick and the sit toggle
+    /// live in their own arm of the cascade, and a second entry answering to the same name would
+    /// shadow one with a network fed an all-zero command it was never trained on. The manifest
+    /// lives on the Hub and cannot be checked from here, so the guard belongs on the board.
+    ///
+    /// It guards the *name* and the *encoding*, not the file. A set that marks
+    /// `alpha_ground_pick.onnx` episodic with neither a name nor a phase command still produces a
+    /// skill — called `alpha_ground_pick`, running a phase-scripted network on zeros. That is a
+    /// publisher's mistake rather than a trap: it shadows nothing, it is plainly visible in
+    /// `robotctl policy list`, and nothing invokes it unless somebody asks for it by that name.
+    /// Catching it would mean a hardcoded list of our own filenames, which is the coupling this
+    /// whole manifest exists to remove.
+    pub fn skills(&self) -> impl Iterator<Item = &SetPolicy> {
+        self.policies
+            .iter()
+            .filter(|p| p.is_zero_command_skill())
+            .filter(|p| !DAEMON_OWNED_SKILLS.contains(&p.skill_name().as_str()))
+    }
+}
+
+/// Skill names the daemon implements itself, which nothing else may take over.
+///
+/// Public because there are three ways to add a skill — a set's manifest, `robotctl policy add`
+/// and `robot.setSkill` — and a list only one of them checks is a guard for one of them. Each
+/// has its own arm of the control cascade, so a table entry answering to either name is
+/// unreachable: `robot.do` matches the built-in first, and the entry sits in the list being
+/// offered and never run.
+pub const DAEMON_OWNED_SKILLS: [&str; 2] = ["ground_pick", "sit_toggle"];
+
+/// The ground pick hands back at this fraction of its cycle when the set does not say — the
+/// prototype's cutoff. Ending at 100% replays the reach on the way out.
+pub const DEFAULT_GROUND_PICK_END_PHASE: f64 = 0.7;
+/// How long the sitstand network rises (posture flag 0) before the gait takes over, when the
+/// set does not say. 1 s is enough on the robot — velstand owns the tail of the rise fine.
+pub const DEFAULT_SITSTAND_RISE_S: f64 = 1.0;
+/// How long the seat takes after the flag flips, when the set does not say: the ~2 s glide the
+/// sit↔stand is trained on (`POSTURE_RAMP_S`).
+pub const DEFAULT_SITSTAND_RAMP_S: f64 = 2.0;
+
+/// Read the installed set's manifest, if it has one.
+pub fn set_manifest() -> Option<SetManifest> {
+    let text = std::fs::read_to_string(PathBuf::from(POLICY_DIR).join("manifest.json")).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// The skills a robot has when its config says nothing.
+///
+/// From the installed set where it says, and from the three below where it does not.
+///
+/// A board whose set predates the manifest keeps its kicks and its roulade with no config
+/// written and no migration run, which is the whole reason absence resolves to something rather
+/// than nothing. This goes when every tagged set carries one.
+fn builtin_skills(manifest: Option<&SetManifest>) -> Vec<SkillDef> {
+    // What the set itself declares. A policy is a skill only if it says it is episodic, drives on
+    // a constant command, and how long it runs — a gait is not something to ask for by name, a
+    // perpetual one needs a hold length that only a person can choose, and a phase-encoded one
+    // is the ground pick.
+    if let Some(manifest) = manifest {
+        let from_set: Vec<SkillDef> = manifest
+            .skills()
+            .filter_map(|p| {
+                Some(SkillDef {
+                    name: p.skill_name(),
+                    path: Some(PathBuf::from(POLICY_DIR).join(&p.file)),
+                    duration: p.duration_s?,
+                    chain: p.chain,
+                    unwind: p.command.as_ref().and_then(|c| c.idle).unwrap_or_default(),
+                    unwind_s: p.unwind_s.unwrap_or(0.0),
+                    params: SkillOverrides {
+                        action_scale: p.action_scale,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+            })
+            .collect();
+        if !from_set.is_empty() {
+            return from_set;
+        }
+    }
+
+    fallback_skills()
+}
+
+/// The three skills every robot has had since the prototype, for a board whose set says nothing
+/// about itself — and the timing a skill slot borrows when it names one the set left out.
+fn fallback_skills() -> Vec<SkillDef> {
+    let kick = |name: &str, file: &str| SkillDef {
+        name: name.to_owned(),
+        // The kick files are `ball_kick_*.onnx`, which is not `<name>.onnx` — the names are the
+        // roles and the files are the training runs. The set's manifest keeps that indirection
+        // in its own `name` field; this is the same thing for a set that predates it.
+        path: Some(PathBuf::from(POLICY_DIR).join(file)),
+        duration: 0.5,
+        chain: false,
+        command: [0.0; 3],
+        unwind: [0.0; 3],
+        unwind_s: 0.0,
+        params: SkillOverrides::default(),
+    };
+    vec![
+        // Order is priority, replacing the hardcoded `roulade > kick` precedence.
+        SkillDef {
+            name: "roulade".to_owned(),
+            path: None,
+            duration: 1.0,
+            // Holding the button chains rolls, which is how the prototype maps a held trigger
+            // onto a one-shot.
+            chain: true,
+            command: [0.0; 3],
+            unwind: [0.0; 3],
+            unwind_s: 0.0,
+            params: SkillOverrides::default(),
+        },
+        kick("kick_left", "ball_kick_left.onnx"),
+        kick("kick_right", "ball_kick_right.onnx"),
+    ]
+}
+
+fn fallback_skill(name: &str) -> Option<SkillDef> {
+    fallback_skills().into_iter().find(|s| s.name == name)
+}
+
+/// One policy slot, named — the seven `[policy]` path keys as a value rather than a field name.
+///
+/// It exists because three places now need to turn the string `"ground_pick"` into *that
+/// particular key*: `robot.loadPolicy` on the wire, the `toml_edit` write `robotctl policy load`
+/// performs, and the per-slot report `robot.policies` answers with. Spelling the mapping out in
+/// each of them is how one of them ends up writing `policy.groundpick` to a file nobody reads
+/// back until the robot will not walk.
+///
+/// [`Slot::as_str`] is the serde key, not a display name, and
+/// [`tests::every_slot_is_a_registry_key`] is what keeps that true.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Slot {
+    Walk,
+    Stand,
+    SitStand,
+    GroundPick,
+    KickLeft,
+    KickRight,
+    Roulade,
+}
+
+impl Slot {
+    /// Every slot, in the order `[policy]` lists them and the order a report should print them.
+    pub const ALL: [Slot; 7] = [
+        Slot::Walk,
+        Slot::Stand,
+        Slot::SitStand,
+        Slot::GroundPick,
+        Slot::KickLeft,
+        Slot::KickRight,
+        Slot::Roulade,
+    ];
+
+    /// The slots that are one-shot skills: each names the `[[policy.skill]]` entry of the same
+    /// name, and its path is what that skill runs. See `PolicyParams::resolved_skills`.
+    pub const SKILLS: [Slot; 3] = [Slot::KickLeft, Slot::KickRight, Slot::Roulade];
+
+    /// The serde key, exactly as `[policy]` spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Slot::Walk => "walk",
+            Slot::Stand => "stand",
+            Slot::SitStand => "sitstand",
+            Slot::GroundPick => "ground_pick",
+            Slot::KickLeft => "kick_left",
+            Slot::KickRight => "kick_right",
+            Slot::Roulade => "roulade",
+        }
+    }
+
+    /// `section.key`, which is what the registry and `toml_edit` want.
+    pub fn config_key(self) -> String {
+        format!("policy.{}", self.as_str())
+    }
+
+    /// Parse a slot name off the wire. `None` for anything else, so a caller can refuse with
+    /// the list of names it does know rather than failing to deserialize.
+    pub fn parse(name: &str) -> Option<Slot> {
+        Slot::ALL.into_iter().find(|s| s.as_str() == name)
+    }
+
+    /// Every slot name, for the "expected one of" half of a refusal.
+    pub fn names() -> String {
+        Slot::ALL
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl std::fmt::Display for Slot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// `[policy]` with every absent field resolved against the mode's defaults.
@@ -608,25 +2336,163 @@ pub struct ResolvedPolicy {
     pub head_lowpass: Option<f64>,
     pub legs_lowpass: Option<f64>,
     pub ground_pick_period: f64,
+    /// Fraction of the cycle at which the ground pick hands back.
+    pub ground_pick_end_phase: f64,
     pub ground_pick_action_scale: f64,
     pub ground_pick_gain_ratio: f64,
-    pub kick_duration: f64,
-    pub roulade_duration: f64,
-    pub roulade_action_scale: f64,
-    pub roulade_gain_ratio: f64,
+    /// The twist's acceleration limit per axis, `[vx, vy, vyaw]`; `None` is no limit.
+    pub twist_accel: [Option<f64>; 3],
+    /// Seconds the sitstand network rises before the gait takes over.
+    pub sitstand_rise_s: f64,
+    /// Seconds the seat takes to settle after the flag flips.
+    pub sitstand_ramp_s: f64,
+    /// The one-shot skills, config merged over the built-ins, in priority order.
+    pub skills: Vec<SkillDef>,
     pub voltage_adapt: bool,
     pub nominal_voltage: f64,
 }
 
+impl ResolvedPolicy {
+    /// The file that will actually be loaded into one slot, after mode defaults are applied.
+    /// `None` means the slot is empty — a capability this robot does not have.
+    pub fn slot(&self, slot: Slot) -> Option<&std::path::Path> {
+        match slot {
+            Slot::Walk => Some(self.walk.as_path()),
+            Slot::Stand => self.stand.as_deref(),
+            Slot::SitStand => self.sitstand.as_deref(),
+            Slot::GroundPick => self.ground_pick.as_deref(),
+            Slot::KickLeft => self.kick_left.as_deref(),
+            Slot::KickRight => self.kick_right.as_deref(),
+            Slot::Roulade => self.roulade.as_deref(),
+        }
+    }
+}
+
 impl PolicyParams {
-    /// Resolve against the default variant ([`Variant::OpenMicroDuck`]). Prefer
-    /// [`Self::resolved_for`] when the board's variant is known.
+    /// Whether `robotd.toml` at `path` allows community policies, read on its own.
+    ///
+    /// For `updaterd`, before every fetch, the way it reads the board
+    /// ([`board::Board::declared`]): so `robotctl configure` applies without a restart, and a file
+    /// that is invalid somewhere else still answers. Missing, unreadable or not a bool is `false`
+    /// — the default, and the answer that downloads nothing.
+    pub fn community_allowed(path: &Path) -> bool {
+        let Some(text) = std::fs::read_to_string(path).ok() else {
+            return false;
+        };
+        let Ok(table) = toml::from_str::<toml::Table>(&text) else {
+            return false;
+        };
+        table
+            .get("policy")
+            .and_then(|policy| policy.get("allow_community"))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    /// The built-in skills with config merged over them, by name.
+    ///
+    /// Merge rather than replace, for the reason every other key in this file resolves the way it
+    /// does: the file is a list of decisions, not a copy of the defaults. Adding `polite-bow` is
+    /// one entry and does not mean re-declaring the three that were already there — and forgetting
+    /// to re-declare one cannot silently remove it, which is the failure mode of the other rule.
+    ///
+    /// A named skill keeps the built-in's position in the priority order; a new one goes last.
+    ///
+    /// **The three skill slots are applied last and win.** `kick_left`, `kick_right` and `roulade`
+    /// are `[policy]` keys like `walk`, and `robotctl policy load roulade <file>` writes that key —
+    /// so the file it names has to be the one the `roulade` skill runs, or the load reports a
+    /// file the robot never touches, which is what it did. A slot naming a skill the set does not
+    /// declare adds it with the built-in's timing; `"none"` switches it off, as it does for a
+    /// `[[policy.skill]]` entry.
+    pub fn resolved_skills(&self) -> Vec<SkillDef> {
+        self.resolved_skills_with(set_manifest().as_ref())
+    }
+
+    /// [`Self::resolved_skills`] against a manifest already read — or none, which is the
+    /// fallback three.
+    pub fn resolved_skills_with(&self, manifest: Option<&SetManifest>) -> Vec<SkillDef> {
+        let mut resolved = builtin_skills(manifest);
+        for configured in &self.skills {
+            match resolved.iter_mut().find(|s| s.name == configured.name) {
+                Some(builtin) => *builtin = configured.clone(),
+                None => resolved.push(configured.clone()),
+            }
+        }
+        for slot in Slot::SKILLS {
+            let Some(path) = self.slot(slot) else {
+                continue;
+            };
+            match resolved.iter_mut().find(|s| s.name == slot.as_str()) {
+                Some(skill) => skill.path = Some(path.clone()),
+                None => {
+                    if let Some(mut skill) = fallback_skill(slot.as_str()) {
+                        skill.path = Some(path.clone());
+                        resolved.push(skill);
+                    }
+                }
+            }
+        }
+        // A skill whose path is the `"none"` sentinel is switched off, which is how a built-in is
+        // removed without a second mechanism for it.
+        resolved.retain(|s| s.resolved_path().is_some());
+        resolved
+    }
+
+    /// What config says about one slot: `None` unset (resolve the mode's default), `Some("none")`
+    /// disabled outright, `Some(path)` an override.
+    pub fn slot(&self, slot: Slot) -> &Option<PathBuf> {
+        match slot {
+            Slot::Walk => &self.walk,
+            Slot::Stand => &self.stand,
+            Slot::SitStand => &self.sitstand,
+            Slot::GroundPick => &self.ground_pick,
+            Slot::KickLeft => &self.kick_left,
+            Slot::KickRight => &self.kick_right,
+            Slot::Roulade => &self.roulade,
+        }
+    }
+
+    /// Set or clear one slot's override. Clearing is what `robotctl policy reset` does, and it
+    /// is why this takes an `Option` rather than having a second method for it.
+    pub fn set_slot(&mut self, slot: Slot, path: Option<PathBuf>) {
+        let field = match slot {
+            Slot::Walk => &mut self.walk,
+            Slot::Stand => &mut self.stand,
+            Slot::SitStand => &mut self.sitstand,
+            Slot::GroundPick => &mut self.ground_pick,
+            Slot::KickLeft => &mut self.kick_left,
+            Slot::KickRight => &mut self.kick_right,
+            Slot::Roulade => &mut self.roulade,
+        };
+        *field = path;
+    }
+
     pub fn resolved(&self) -> ResolvedPolicy {
         self.resolved_for(Variant::default())
     }
 
     pub fn resolved_for(&self, variant: Variant) -> ResolvedPolicy {
-        let release = |name: &str| PathBuf::from(RELEASE_DIR).join("policies").join(name);
+        self.resolved_with_variant(set_manifest().as_ref(), variant)
+    }
+
+    /// [`Self::resolved`] against a manifest already read — or none, which is what a board whose
+    /// set predates the manifest has, and resolves to the prototype's numbers.
+    ///
+    /// **The set says how its own policies run.** The ground pick's cycle and the sit↔stand's rise
+    /// used to be literals here, per mode, which meant a retrained pick with a longer cycle was a
+    /// daemon release. They come from the set's phase-encoded and posture-flag entries now; the
+    /// literals stay as the fallback, and a `[policy]` key still overrides either, because the
+    /// file is the list of a person's decisions.
+    pub fn resolved_with(&self, manifest: Option<&SetManifest>) -> ResolvedPolicy {
+        self.resolved_with_variant(manifest, Variant::default())
+    }
+
+    fn resolved_with_variant(
+        &self,
+        manifest: Option<&SetManifest>,
+        variant: Variant,
+    ) -> ResolvedPolicy {
+        let release = |name: &str| PathBuf::from(POLICY_DIR).join(name);
         let path = |field: &Option<PathBuf>, default: Option<&str>| -> Option<PathBuf> {
             match field {
                 Some(p) if is_none_sentinel(p) => None,
@@ -635,13 +2501,16 @@ impl PolicyParams {
             }
         };
 
-        let (walk_default, stand, sitstand, ground_pick, kick) = match self.mode {
+        let (walk_default, stand, sitstand, ground_pick) = match self.mode {
+            // The velstand gait (set v5) walks on a twist and stands still at zero command,
+            // so no standing network is loaded by default: with `stand` unset the walking
+            // policy runs at every velocity. `alpha_walking.onnx` + `alpha_stand.onnx` stay
+            // in the set for a board that loads them back by hand.
             Mode::Walk => (
-                "alpha_walking.onnx",
-                Some("alpha_stand.onnx"),
+                "velstand.onnx",
+                None,
                 Some("alpha_sitstand.onnx"),
                 Some("alpha_ground_pick.onnx"),
-                true,
             ),
             // The prototype's roller preset, since rebased on the alpha defaults: roller
             // policy, crouch on the ground-pick trigger, and everything else — sit/stand,
@@ -654,20 +2523,46 @@ impl PolicyParams {
                 None,
                 Some("alpha_sitstand.onnx"),
                 Some("roller_crouch.onnx"),
-                true,
             ),
         };
+
+        // What each skill slot reports is what the skill of that name will run — derived from the
+        // list rather than resolved beside it, so `robot.policies` cannot name a file the robot is
+        // not running.
+        let skills = self.resolved_skills_with(manifest);
+        let skill_file = |name: &str| {
+            skills
+                .iter()
+                .find(|s| s.name == name)
+                .and_then(|s| s.resolved_path())
+        };
+
+        // The set's own timing for the two networks the daemon drives itself, for this mode.
+        let pick = manifest.and_then(|m| m.ground_pick(self.mode));
+        let seat = manifest.and_then(|m| m.sitstand());
 
         ResolvedPolicy {
             enabled: self.enabled,
             mode: self.mode,
-            walk: path(&self.walk, Some(walk_default)).expect("walk always has a default"),
+            // `walk` is the one slot that cannot be empty — a robot with no walking network has
+            // nothing to run — so the `"none"` sentinel does not apply to it and falls back to
+            // the mode's default instead.
+            //
+            // This used to be `.expect("walk always has a default")`, and a config saying
+            // `walk = "none"` panicked whichever thread resolved it. That thread is the control
+            // loop, so one line in a file killed the robot's control until somebody edited it
+            // back — the exact "a bad config line must not brick the board" failure the degraded
+            // health rule exists to prevent. `robot.loadPolicy` refuses to write it and
+            // `drop_unloadable_overrides` clears it at startup and reports degraded; this is the
+            // floor under both.
+            walk: path(&self.walk, Some(walk_default))
+                .unwrap_or_else(|| PathBuf::from(POLICY_DIR).join(walk_default)),
             stand: path(&self.stand, stand),
             sitstand: path(&self.sitstand, sitstand),
             ground_pick: path(&self.ground_pick, ground_pick),
-            kick_left: path(&self.kick_left, kick.then_some("ball_kick_left.onnx")),
-            kick_right: path(&self.kick_right, kick.then_some("ball_kick_right.onnx")),
-            roulade: path(&self.roulade, Some("roulade.onnx")),
+            kick_left: skill_file("kick_left"),
+            kick_right: skill_file("kick_right"),
+            roulade: skill_file("roulade"),
             action_scale: self.action_scale.unwrap_or(match self.mode {
                 Mode::Walk => 0.9,
                 Mode::Roller => 0.8,
@@ -677,19 +2572,35 @@ impl PolicyParams {
             gain: self.gain.unwrap_or(variant.running_gain()),
             head_lowpass: Some(self.head_lowpass.unwrap_or(0.5)).filter(|a| *a < 1.0),
             legs_lowpass: Some(self.legs_lowpass.unwrap_or(0.7)).filter(|a| *a < 1.0),
-            ground_pick_period: self.ground_pick_period.unwrap_or(match self.mode {
-                Mode::Walk => 4.0,
-                Mode::Roller => 3.0,
-            }),
-            ground_pick_action_scale: self.ground_pick_action_scale.unwrap_or(match self.mode {
-                Mode::Walk => 1.0,
-                Mode::Roller => 0.8,
-            }),
+            ground_pick_period: self
+                .ground_pick_period
+                .or(pick.map(|t| t.period_s))
+                .unwrap_or(match self.mode {
+                    Mode::Walk => 4.0,
+                    Mode::Roller => 3.0,
+                }),
+            ground_pick_end_phase: pick
+                .map(|t| t.end_phase)
+                .unwrap_or(DEFAULT_GROUND_PICK_END_PHASE),
+            ground_pick_action_scale: self
+                .ground_pick_action_scale
+                .or(pick.and_then(|t| t.action_scale))
+                .unwrap_or(match self.mode {
+                    Mode::Walk => 1.0,
+                    Mode::Roller => 0.8,
+                }),
             ground_pick_gain_ratio: self.ground_pick_gain_ratio,
-            kick_duration: self.kick_duration,
-            roulade_duration: self.roulade_duration,
-            roulade_action_scale: self.roulade_action_scale,
-            roulade_gain_ratio: self.roulade_gain_ratio,
+            // Only the roller's forward/back. A roller reversing from full forward to full back
+            // in the EMA's ~0.25 s fell over; walking never asked for a limit, and the roller's
+            // yaw has to stay quick enough to steer.
+            twist_accel: {
+                let roller_vx = (self.mode == Mode::Roller).then_some(1.0);
+                [self.accel_vx.or(roller_vx), self.accel_vy, self.accel_vyaw]
+                    .map(|a| a.filter(|a| *a > 0.0))
+            },
+            sitstand_rise_s: seat.map_or(DEFAULT_SITSTAND_RISE_S, |t| t.rise_s),
+            sitstand_ramp_s: seat.map_or(DEFAULT_SITSTAND_RAMP_S, |t| t.ramp_s),
+            skills,
             voltage_adapt: self.voltage_adapt,
             nominal_voltage: self.nominal_voltage.unwrap_or(variant.nominal_voltage()),
         }
@@ -716,9 +2627,8 @@ pub struct SafetyParams {
     pub battery_empty_shutdown: bool,
 
     /// Go limp *while falling*, to land soft instead of fighting the floor all the way
-    /// down. **On by default** since it was validated on a robot — the whole point is that
-    /// the fleet lands soft, and a mode every board has to opt into individually is a mode
-    /// most boards do not have.
+    /// down. **On by default.** With the default velstand gait (set v5) no standing network
+    /// is loaded, so the hand-back is to velstand at zero command, which stands still.
     ///
     /// The only thing the daemon does about a fall. Drop to `gain_limp`, let the robot
     /// collapse, pose it back to standing once it has landed, then hand it to the standing
@@ -738,6 +2648,11 @@ pub struct SafetyParams {
     /// longer than a footfall impulse, short enough to leave most of the fall to limp
     /// through.
     pub limp_fall_debounce_ms: u64,
+    /// How long the robot must have stood (inside `limp_fall_tilt_z`) before a fall can
+    /// fire, again after every limp. A fall happens to a robot that was up: without this, a
+    /// robot the limp pose leaves lying on its front at ~58° — not `fallen` — sagging as the
+    /// policy takes it reads as a fall, and limps, poses and limps again.
+    pub limp_fall_arm_ms: u64,
     /// Angular-rate magnitude below which the robot counts as having landed, rad/s.
     pub limp_fall_still_rate: f64,
     /// How long it has to stay that still before the limp ends.
@@ -779,12 +2694,13 @@ impl Default for PolicyParams {
             ground_pick_period: None,
             ground_pick_action_scale: None,
             ground_pick_gain_ratio: 1.0,
-            kick_duration: 0.5,
-            roulade_duration: 1.0,
-            roulade_action_scale: 1.0,
-            roulade_gain_ratio: 1.0,
+            accel_vx: None,
+            accel_vy: None,
+            accel_vyaw: None,
+            skills: Vec::new(),
             voltage_adapt: false,
             nominal_voltage: None,
+            allow_community: false,
         }
     }
 }
@@ -802,6 +2718,7 @@ impl Default for SafetyParams {
             limp_fall_predict_z: -0.5,
             limp_fall_lookahead_ms: 300,
             limp_fall_debounce_ms: 60,
+            limp_fall_arm_ms: 200,
             limp_fall_still_rate: 1.0,
             limp_fall_still_ms: 200,
             limp_fall_max_ms: 1500,
@@ -917,6 +2834,69 @@ pub struct Bus {
     /// HD1910-C001) is the default and the migration target; [`Driver::Xl330`] (the
     /// Dynamixel XL330) is the fallback for a robot whose servos were not migrated.
     pub driver: Driver,
+    /// Read the bus with fast sync read (protocol 2.0 instruction 0x8A) rather than a plain
+    /// sync read: the sixteen devices append their blocks to one status packet instead of
+    /// each sending its own, which is fifteen packet headers and fifteen bus turnarounds off
+    /// every tick.
+    ///
+    /// On by default, because that is what this robot's hardware does and a setting nobody
+    /// has to find is worth more than a saving nobody gets. It is a setting rather than a
+    /// constant because the instruction is a property of *firmware* — XL330 v46 or newer, and
+    /// the `imu_to_dxl` board has to implement it too — so a board built before either is the
+    /// one case this code cannot talk its way out of. Turning it off is the whole remedy.
+    ///
+    /// The symptom of getting it wrong is unambiguous, which is why the default can be the
+    /// brave one: a device that does not implement 0x8A does not answer at all, so *every*
+    /// read times out rather than some of them returning something plausible. The loop reports
+    /// the bus drops, `update_gate` sees an unhealthy robot, and a release that turned this on
+    /// against firmware that cannot do it is rolled back on its own.
+    pub fast_sync_read: bool,
+    /// The impact guard on servos running ROBOTIS's impact guard firmwares (V3, V4): a servo that
+    /// hits something brakes, then holds softly, and its PWM limit falls with speed — the fix for
+    /// broken gear teeth. **Off by default** until it is understood why a stress test robot on it
+    /// fell on its own far more often than any other (2026-11-09); an update that turns this on is
+    /// how robots get it. Off leaves the factory firmware with only Current Limit: settings that
+    /// never fire on V3, the switch on V4, which keeps the settings it has. On writes the six
+    /// `impact_guard_*` settings below to every V3 and V4 servo at startup with torque off, and
+    /// V4's Impact Guard Enable follows this with every torque on; servos on any other firmware
+    /// have no guard to set. Their defaults are what a microduck walks with:
+    /// a short brake on fast arrivals only, no hold, and a stronger speed taper. ROBOTIS's factory
+    /// values, the gear-breakage bench's, made a walking robot fall. Changing them is how a robot
+    /// test looks for a guard that keeps the gears whole and still lets the policy walk.
+    pub impact_guard: bool,
+    /// V Min, rad/s: an impact counts only while the servo moves toward its goal faster.
+    pub impact_guard_v_min: u8,
+    /// Brake Time, ms: how long the H-bridge is shorted after an impact.
+    pub impact_guard_brake_ms: u8,
+    /// Deceleration, rad/s²: what counts as an impact.
+    pub impact_guard_decel: u16,
+    /// i Hold, mA: the current allowed after the brake, until the goal comes back past the
+    /// position.
+    pub impact_guard_i_hold_ma: u16,
+    /// V Fast, rad/s: where the PWM limit has fallen to `impact_guard_pwm_fast`. Not 0: the
+    /// firmware divides by it.
+    pub impact_guard_v_fast: u8,
+    /// PWM Fast, % of PWM Limit, at `impact_guard_v_fast` and above.
+    pub impact_guard_pwm_fast: u8,
+}
+
+impl Bus {
+    /// The first impact guard setting the firmware cannot take, and why.
+    fn invalid(&self) -> Option<(&'static str, &'static str)> {
+        if self.impact_guard_v_fast == 0 {
+            return Some((
+                "impact_guard_v_fast",
+                "must be above 0: the firmware divides by it",
+            ));
+        }
+        if !(1..=100).contains(&self.impact_guard_pwm_fast) {
+            return Some((
+                "impact_guard_pwm_fast",
+                "must be 1 to 100, a percentage of PWM Limit",
+            ));
+        }
+        None
+    }
 }
 
 /// The servo bus driver — which protocol the serial port speaks.
@@ -972,6 +2952,20 @@ pub struct Control {
     pub cmd_alpha: f64,
     /// Same, for head targets and the body pose.
     pub head_alpha: f64,
+    /// Whether the state stream carries measured joint velocity and load
+    /// (`RobotState::velocities`, `RobotState::currents_ma`).
+    ///
+    /// On. The servos report both in the same twelve-byte read as position, so the robot pays
+    /// nothing on the bus for them, and present current is its only measure of external force —
+    /// a foot taking weight, a hand on the beak, a servo on its way to an overload shutdown.
+    ///
+    /// Here, on the control loop, because the control loop is what assembles the frame. What it
+    /// costs is frame size: about 10–12 % of a full frame, which is +15 to +19 KB/s at 50 Hz to
+    /// each subscriber that asked for every tick. Off is the way out if that turns out to matter
+    /// on a particular robot, or if a consumer turns out to mishandle the fields — and off means
+    /// *absent*, the same thing an older daemon sends, not zeros. Nothing in this daemon reads
+    /// them back, so turning it off costs the robot nothing but the information.
+    pub publish_velocity_and_load: bool,
 }
 
 /// Thresholds that decide `healthy` — and therefore whether an update is kept.
@@ -1007,13 +3001,48 @@ pub struct UpdateGate {
     /// Consecutive bus read failures tolerated before reporting unhealthy. One dropped
     /// transaction is ordinary; a run of them means the bus is gone.
     pub max_consecutive_errors: u32,
+    /// Seconds after boot by which `robot-boot-check` stops waiting and decides whether the
+    /// release came up. Not robotd's: the script reads it, once per boot.
+    ///
+    /// Not a wait. A healthy boot is decided as soon as every daemon has run steadily for 10 s,
+    /// well before this. It is what a boot that never settles is judged at, by restart counts —
+    /// and `updaterd`, restarting every 10 s, needs about 45 s to show a crash loop, which is why
+    /// the default is 60. Below that, a release whose `updaterd` cannot start passes.
+    ///
+    /// Clamped to [`BOOT_DEADLINE_MIN_S`]–[`BOOT_DEADLINE_MAX_S`] by the script rather than
+    /// refused here: every daemon reading this file exits on a value [`Params::load`] refuses,
+    /// and a robotd that will not start is exactly what the check rolls a release back for.
+    pub boot_deadline_s: u32,
+    /// Whether anything may put this robot back on another release without being asked: the
+    /// health gate reverting a failed `update apply` / `select` / `rollback`, the boot counter
+    /// reverting an unconfirmed trial, and `robot-boot-check` handing over to `robot-rescue`.
+    ///
+    /// Off by default. A release that fails is left live and reported `Stuck`, and the operator
+    /// reverts by hand (`robotctl update rollback`). Not robotd's: `updaterd` reads it at the
+    /// moment it would revert ([`UpdateGate::auto_rollback_enabled`]), and the boot check reads
+    /// it once per boot.
+    pub auto_rollback: bool,
 }
+
+/// The bounds `robot-boot-check` clamps `[update_gate] boot_deadline_s` to. The script repeats
+/// them; `xtask/tests/rescue.rs` keeps the two equal.
+pub const BOOT_DEADLINE_MIN_S: u32 = 20;
+/// Below the script's 600 s uptime guard, past which it declines to act at all.
+pub const BOOT_DEADLINE_MAX_S: u32 = 300;
 
 impl Default for Bus {
     fn default() -> Self {
         Self {
             port: "/dev/ttyS2".into(),
             driver: Driver::default(),
+            fast_sync_read: true,
+            impact_guard: false,
+            impact_guard_v_min: 6,
+            impact_guard_brake_ms: 20,
+            impact_guard_decel: 400,
+            impact_guard_i_hold_ma: 32767,
+            impact_guard_v_fast: 7,
+            impact_guard_pwm_fast: 40,
         }
     }
 }
@@ -1033,6 +3062,7 @@ impl Default for Control {
             hz: 50,
             cmd_alpha: 0.2,
             head_alpha: 0.2,
+            publish_velocity_and_load: true,
         }
     }
 }
@@ -1048,7 +3078,32 @@ impl Default for UpdateGate {
             // health check that trips on jitter rolls back good releases.
             stall_periods: 25,
             max_consecutive_errors: 10,
+            boot_deadline_s: 60,
+            auto_rollback: false,
         }
+    }
+}
+
+impl UpdateGate {
+    /// Whether `[update_gate] auto_rollback` is on in `robotd.toml` at `path`, read on its own.
+    ///
+    /// For `updaterd`, at the moment it would revert, the way it reads the board
+    /// ([`board::Board::declared`]): so `robotctl configure` applies without a restart, and a
+    /// file that is invalid somewhere else still answers. Both layers, the user's winning.
+    /// Missing, unreadable or not a bool is `false` — the default, and the answer that leaves the
+    /// release alone.
+    pub fn auto_rollback_enabled(path: &Path) -> bool {
+        let Ok(text) = layered_text(path) else {
+            return false;
+        };
+        let Ok(table) = toml::from_str::<toml::Table>(&text) else {
+            return false;
+        };
+        table
+            .get("update_gate")
+            .and_then(|gate| gate.get("auto_rollback"))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false)
     }
 }
 
@@ -1068,6 +3123,12 @@ pub enum ParamsError {
     },
     #[error("{path}: control.hz must be between 1 and 1000, got {got}")]
     Rate { path: String, got: u32 },
+    #[error("{path}: invalid controller setting {key}: {reason}")]
+    PadSetting {
+        path: String,
+        key: String,
+        reason: &'static str,
+    },
     #[error(
         "{path}: media.bitrate must be between {min} and {max} bits per second, got {got} — \
          the unit is bits, so 2 Mb/s is 2000000"
@@ -1082,6 +3143,52 @@ pub enum ParamsError {
         "{path}: policy.home must be 15 finite joint angles in degrees (one turn, ±180, JOINT_NAMES order), {reason}"
     )]
     Home { path: String, reason: String },
+    #[error("{path}: {reason}")]
+    Netpad { path: String, reason: String },
+    #[error(
+        "{path}: pad_drive.{axis}_min must be zero or negative and pad_drive.{axis}_max zero or \
+         positive, got {min} and {max} — the bounds are signed, so full stick back at 0.2 m/s is \
+         vx_min = -0.2"
+    )]
+    PadDrive {
+        path: String,
+        axis: &'static str,
+        min: f64,
+        max: f64,
+    },
+    #[error("{path}: bus.{key} {reason}")]
+    Bus {
+        path: String,
+        key: &'static str,
+        reason: &'static str,
+    },
+    #[error("{path}: policy.{key} {reason}")]
+    Policy {
+        path: String,
+        key: &'static str,
+        reason: &'static str,
+    },
+    #[error("{path}: laser.{key} {reason}")]
+    Laser {
+        path: String,
+        key: &'static str,
+        reason: &'static str,
+    },
+    #[error("{path}: idle.{key} {reason}")]
+    Idle {
+        path: String,
+        key: &'static str,
+        reason: &'static str,
+    },
+    #[error(
+        "{path}: pickup.resume_threshold ({resume}) must be below pickup.pause_threshold \
+         ({pause}), and both between 0 and 1 — they are a hysteresis band on a probability"
+    )]
+    Pickup {
+        path: String,
+        pause: f32,
+        resume: f32,
+    },
 }
 
 /// The band `media.bitrate` is accepted in, bits per second.
@@ -1098,7 +3205,78 @@ impl Params {
     /// unprovisioned board should still come up on defaults rather than refuse to start,
     /// and a daemon that will not start is much harder to diagnose remotely than one
     /// running on known defaults. A file explicitly named on the command line must exist.
+    ///
+    /// At [`DEFAULT_PATH`] this is both layers, merged ([`user_layer_for`]). The base's errors
+    /// are fatal, as they always were; the user layer's are not — see
+    /// [`Params::user_layer_rejected`].
     pub fn load(path: &Path, explicit: bool) -> Result<Self, ParamsError> {
+        match user_layer_for(path) {
+            Some(user) => Self::load_layered(path, &user, explicit),
+            None => Self::load_one(path, explicit),
+        }
+    }
+
+    /// The base at `base` with the user layer at `user` over it.
+    ///
+    /// [`Params::load`] calls this for the provisioned path; it is public so a test can point it
+    /// at two temporary files.
+    pub fn load_layered(base: &Path, user: &Path, explicit: bool) -> Result<Self, ParamsError> {
+        let alone = Self::load_one(base, explicit)?;
+        match Self::with_user_layer(base, user) {
+            Ok(Some(merged)) => Ok(merged),
+            Ok(None) => Ok(alone),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "the user config is invalid; running on the base config alone until it is fixed"
+                );
+                Ok(Self {
+                    user_layer_rejected: Some(e.to_string()),
+                    ..alone
+                })
+            }
+        }
+    }
+
+    /// Both layers merged and validated, `Ok(None)` when there is no user layer, or the reason
+    /// the user layer cannot be used.
+    ///
+    /// The editor's gate as well as the loader's: [`edit`] validates a staged user layer through
+    /// this before renaming it into place, so nothing it writes is a layer the daemon would set
+    /// aside.
+    pub fn with_user_layer(base: &Path, user: &Path) -> Result<Option<Self>, ParamsError> {
+        let read = |path: &Path| {
+            read_optional(path).map_err(|source| ParamsError::Read {
+                path: path.display().to_string(),
+                source,
+            })
+        };
+        let Some(user_text) = read(user)? else {
+            return Ok(None);
+        };
+        // The user layer on its own first, so a syntax error or a wrong type is reported against
+        // the file somebody edited, with its own line and column — not against a merged document
+        // nobody has ever seen. Not validated alone: a partial file is not a robot, and the
+        // cross-key checks need the base's values.
+        Self::parse_file(&user_text, user, false)?;
+        let base_text = read(base)?.unwrap_or_default();
+        let table = |text: &str, path: &Path| {
+            text.parse::<toml::Table>()
+                .map_err(|source| ParamsError::Parse {
+                    path: path.display().to_string(),
+                    source,
+                })
+        };
+        let merged = merge_layers(table(&base_text, base)?, table(&user_text, user)?).to_string();
+        // Errors from here on are named after the user layer: the base passed alone, so whatever
+        // fails now is something the user layer brought.
+        let params = Self::parse_file(&merged, user, true)?;
+        params.validate(user)?;
+        Ok(Some(params))
+    }
+
+    /// One file, as `load` read it before there were layers.
+    fn load_one(path: &Path, explicit: bool) -> Result<Self, ParamsError> {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && !explicit => {
@@ -1112,41 +3290,58 @@ impl Params {
                 });
             }
         };
+        let params = Self::parse_file(&text, path, true)?;
+        params.validate(path)?;
+        Ok(params)
+    }
 
+    /// Text into `Params` for a file at `path`, as [`Params::parse`] does it, the error naming
+    /// `path`. `warn` is false for a pass whose unknown keys the next pass will report anyway.
+    fn parse_file(text: &str, path: &Path, warn: bool) -> Result<Self, ParamsError> {
+        let (params, ignored) = Self::parse(text).map_err(|source| ParamsError::Parse {
+            path: path.display().to_string(),
+            source,
+        })?;
+        if warn && !ignored.is_empty() {
+            tracing::warn!(
+                path = %path.display(),
+                ignored = %ignored.join(", "),
+                "this build has no such keys; they are ignored and their values do nothing"
+            );
+        }
+        Ok(params)
+    }
+
+    /// Parse the text of a `robotd.toml` the way the daemon does, unknown keys dropped (see
+    /// [`without_unknown_keys`]), and name the ones that were. No range checks — that is
+    /// [`Params::load`]'s second half.
+    ///
+    /// **Everything that reads this file goes through here**, not through `toml::from_str`. The
+    /// editor and the pad bindings once parsed strictly, so a key left behind by another branch
+    /// meant a robot that walked fine and a `robotctl configure` that would not open — and a
+    /// `pad.bind` that showed the phone the default bindings rather than the real ones.
+    pub fn parse(text: &str) -> Result<(Self, Vec<String>), toml::de::Error> {
         // Strict first. A file this build fully understands parses exactly as it always has —
         // one pass, serde's own spans, no second guess — and that is the overwhelmingly common
         // case. The lenient path below only ever runs on a file that has already failed.
-        let params = match toml::from_str::<Params>(&text) {
-            Ok(params) => params,
+        match toml::from_str::<Params>(text) {
+            Ok(params) => Ok((params, Vec::new())),
             // Not an unknown-key problem: a syntax error, or a value of the wrong type. The
             // strict error is what gets reported, because it is the one carrying a line and a
             // column.
             Err(source) => {
-                let Some((reparsed, ignored)) = without_unknown_keys(&text) else {
-                    return Err(ParamsError::Parse {
-                        path: path.display().to_string(),
-                        source,
-                    });
+                let Some((reparsed, ignored)) = without_unknown_keys(text) else {
+                    return Err(source);
                 };
-                tracing::warn!(
-                    path = %path.display(),
-                    ignored = %ignored.join(", "),
-                    "this build has no such keys; they are ignored and their values do nothing"
-                );
                 // Pruned, and what is left still does not parse — a real error sharing a file
                 // with an inert one. This reports the real one, which costs the position: serde
                 // is now looking at a table rather than at the text. The alternative was worse.
                 // Returning the strict error here would name the key this release just declared
                 // harmless as the reason the daemon will not start, and send whoever reads it to
                 // delete a section that was never the problem.
-                reparsed.map_err(|source| ParamsError::Parse {
-                    path: path.display().to_string(),
-                    source,
-                })?
+                Ok((reparsed?, ignored))
             }
-        };
-        params.validate(path)?;
-        Ok(params)
+        }
     }
 
     /// Reject values that would produce a loop that cannot work, at startup rather than as
@@ -1156,6 +3351,13 @@ impl Params {
             return Err(ParamsError::Rate {
                 path: path.display().to_string(),
                 got: self.control.hz,
+            });
+        }
+        if let Some((key, reason)) = self.laser.check() {
+            return Err(ParamsError::Laser {
+                path: path.display().to_string(),
+                key,
+                reason,
             });
         }
         // Checked here rather than in `mediad`, so `robotctl configure` refuses to write it:
@@ -1172,6 +3374,138 @@ impl Params {
         }
         if let Some(home) = &self.policy.home {
             validate_home(path, home)?;
+        }
+        // Signed bounds, so a positive `_min` is somebody who wrote a magnitude: full stick
+        // back would then walk the robot *forward*. Refused rather than taken as its absolute
+        // value, because the editor should say which of the two readings it was not going to
+        // guess.
+        for (axis, min, max) in self.pad_drive.axes() {
+            if !(min.is_finite() && max.is_finite() && min <= 0.0 && max >= 0.0) {
+                return Err(ParamsError::PadDrive {
+                    path: path.display().to_string(),
+                    axis,
+                    min,
+                    max,
+                });
+            }
+        }
+        if let Some((key, reason)) = self.bus.invalid() {
+            return Err(ParamsError::Bus {
+                path: path.display().to_string(),
+                key,
+                reason,
+            });
+        }
+        for (key, accel) in [
+            ("accel_vx", self.policy.accel_vx),
+            ("accel_vy", self.policy.accel_vy),
+            ("accel_vyaw", self.policy.accel_vyaw),
+        ] {
+            if accel.is_some_and(|a| !(a.is_finite() && a >= 0.0)) {
+                return Err(ParamsError::Policy {
+                    path: path.display().to_string(),
+                    key,
+                    reason: "must be finite and nonnegative (0 is no limit)",
+                });
+            }
+        }
+        if let Some((key, reason)) = self.idle.invalid() {
+            return Err(ParamsError::Idle {
+                path: path.display().to_string(),
+                key,
+                reason,
+            });
+        }
+        // Refused rather than clamped, like `control.hz`: the editor should say which value it
+        // was not going to guess at. The floor is 10 because netpadd's 100 ms fallback tick must
+        // not be faster than the cap, and below a few Hz a held stick would outrun robotd's deadman.
+        if !(10..=100).contains(&self.netpad.max_hz) {
+            return Err(ParamsError::Netpad {
+                path: path.display().to_string(),
+                reason: format!("netpad.max_hz ({}) must be 10–100", self.netpad.max_hz),
+            });
+        }
+        // Gated on `enabled` because robotd loads this file too: a board not using netpad must
+        // never fail to load over a section it does not read.
+        if self.netpad.enabled {
+            let n = &self.netpad;
+            let reason = if n.stale_ms == 0 || n.stale_ms >= self.safety.deadman_ms {
+                Some(format!(
+                    "netpad.stale_ms ({}) must be above 0 and below safety.deadman_ms ({}) — \
+                     past the deadman it would keep a stalled client's last stick going",
+                    n.stale_ms, self.safety.deadman_ms
+                ))
+            } else if n.timeout_ms < n.stale_ms {
+                Some(format!(
+                    "netpad.timeout_ms ({}) must be at least netpad.stale_ms ({}) — the client is \
+                     stopped before it counts as gone",
+                    n.timeout_ms, n.stale_ms
+                ))
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                return Err(ParamsError::Netpad {
+                    path: path.display().to_string(),
+                    reason,
+                });
+            }
+        }
+        let invalid = |key: &str, reason| ParamsError::PadSetting {
+            path: path.display().to_string(),
+            key: key.to_owned(),
+            reason,
+        };
+        if !(self.pad_axes.deadzone.is_finite() && (0.0..1.0).contains(&self.pad_axes.deadzone)) {
+            return Err(invalid("pad_axes.deadzone", "must be finite and in [0, 1)"));
+        }
+        for (key, binding) in self.pad_axes.bindings() {
+            if !(binding.gain.is_finite() && binding.gain >= 0.0) {
+                return Err(invalid(
+                    &format!("{key}.gain"),
+                    "must be finite and nonnegative",
+                ));
+            }
+        }
+        for (key, value) in [
+            ("pad_head.neck_pitch_max", self.pad_head.neck_pitch_max),
+            ("pad_head.head_pitch_max", self.pad_head.head_pitch_max),
+            ("pad_head.head_yaw_max", self.pad_head.head_yaw_max),
+            ("pad_head.head_roll_max", self.pad_head.head_roll_max),
+            ("pad_body.pitch_max", self.pad_body.pitch_max),
+            ("pad_body.roll_max", self.pad_body.roll_max),
+        ] {
+            if !(value.is_finite() && value >= 0.0) {
+                return Err(invalid(key, "must be finite and nonnegative"));
+            }
+        }
+        for (key, min, max) in std::iter::once((
+            "pad_body.z".to_owned(),
+            self.pad_body.z_min,
+            self.pad_body.z_max,
+        ))
+        .chain(
+            self.pad_roller
+                .limits()
+                .axes()
+                .into_iter()
+                .map(|(axis, min, max)| (format!("pad_roller.{axis}"), min, max)),
+        ) {
+            if !(min.is_finite() && max.is_finite() && min <= 0.0 && max >= 0.0) {
+                return Err(invalid(
+                    &key,
+                    "min must be finite and nonpositive; max finite and nonnegative",
+                ));
+            }
+        }
+        // An inverted band would pause and resume on the same probability, every tick.
+        let (pause, resume) = (self.pickup.pause_threshold, self.pickup.resume_threshold);
+        if !(0.0 < resume && resume < pause && pause < 1.0) {
+            return Err(ParamsError::Pickup {
+                path: path.display().to_string(),
+                pause,
+                resume,
+            });
         }
         Ok(())
     }
@@ -1235,13 +3569,38 @@ fn validate_home(path: &Path, home: &[f64]) -> Result<(), ParamsError> {
         });
     }
     let limit = std::f64::consts::PI + 1e-3;
-    if home.iter().any(|angle| !angle.is_finite() || angle.abs() > limit) {
+    if home
+        .iter()
+        .any(|angle| !angle.is_finite() || angle.abs() > limit)
+    {
         return Err(ParamsError::Home {
             path: path.display().to_string(),
             reason: "an angle is not finite or is outside ±180°".to_owned(),
         });
     }
     Ok(())
+}
+
+/// Drops every key under `prefix` the registry does not know, recursing into tables that hold
+/// registry keys — `[pad_axes.drive.vyaw]` is three levels down — and naming each one dropped.
+fn prune_fields(prefix: &str, fields: &mut toml::Table, ignored: &mut Vec<String>) {
+    fields.retain(|key, value| {
+        let path = format!("{prefix}.{key}");
+        if registry::entry_for(&path).is_some() {
+            return true;
+        }
+        if registry::REGISTRY
+            .iter()
+            .any(|entry| entry.key.starts_with(&format!("{path}.")))
+        {
+            if let Some(children) = value.as_table_mut() {
+                prune_fields(&path, children, ignored);
+            }
+            return true;
+        }
+        ignored.push(path);
+        false
+    });
 }
 
 /// Re-parse a file that `deny_unknown_fields` rejected, dropping the keys this build has no
@@ -1290,14 +3649,7 @@ fn without_unknown_keys(text: &str) -> Option<(Result<Params, toml::de::Error>, 
             ignored.push(format!("[{section}]"));
             return false;
         }
-        fields.retain(|key, _| {
-            if registry::entry_for(&format!("{section}.{key}")).is_some() {
-                true
-            } else {
-                ignored.push(format!("{section}.{key}"));
-                false
-            }
-        });
+        prune_fields(section, fields, &mut ignored);
         true
     });
 
@@ -1310,8 +3662,815 @@ fn without_unknown_keys(text: &str) -> Option<(Result<Params, toml::de::Error>, 
     Some((toml::Value::Table(table).try_into::<Params>(), ignored))
 }
 
+/// What [`AudioParams::resolve_devices`] decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedAudio {
+    pub playback: String,
+    pub capture: String,
+    /// The card the configured device named and this board lacks, when the fallback was taken.
+    pub missing_card: Option<String>,
+}
+
+/// The card id an ALSA device string names, when it names one by id: `plughw:aic3104`,
+/// `hw:aic3104,0`, `plughw:CARD=aic3104,DEV=0`. `None` for anything else.
+fn named_card(device: &str) -> Option<&str> {
+    let (plugin, args) = device.split_once(':')?;
+    if plugin != "hw" && plugin != "plughw" {
+        return None;
+    }
+    let first = args.split(',').next()?;
+    let card = first.strip_prefix("CARD=").unwrap_or(first);
+    // A numeric card is an index, not an id: nothing to match against /proc/asound/cards.
+    (!card.is_empty() && !card.bytes().all(|b| b.is_ascii_digit())).then_some(card)
+}
+
+/// The card ids in the text of `/proc/asound/cards`, whose card lines read
+/// ` 0 [rockchiprk809  ]: simple-card - rockchip-rk809` (each followed by a description line).
+pub fn alsa_card_ids(proc_asound_cards: &str) -> Vec<String> {
+    proc_asound_cards
+        .lines()
+        .filter_map(|line| {
+            let (index, rest) = line.trim_start().split_once(' ')?;
+            if index.is_empty() || !index.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let id = rest
+                .trim_start()
+                .strip_prefix('[')?
+                .split(']')
+                .next()?
+                .trim();
+            (!id.is_empty()).then(|| id.to_owned())
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    /// [`Slot::as_str`] must be the *serde key*, because `robotctl policy load` writes
+    /// `policy.<slot>` into `robotd.toml` with it. A display name that merely reads well —
+    /// `sit_stand`, `groundPick` — would write a key `Params` then ignores as unknown, and the
+    /// symptom is a load that reports success and changes nothing until the next reboot proves
+    /// it never stuck.
+    ///
+    /// The registry is the right thing to check against rather than `PolicyParams`'s fields,
+    /// because it is itself pinned complete against serde's own field list.
+    #[test]
+    fn every_slot_is_a_registry_key() {
+        for slot in super::Slot::ALL {
+            let key = slot.config_key();
+            let entry = crate::registry::REGISTRY
+                .iter()
+                .find(|e| e.key == key)
+                .unwrap_or_else(|| panic!("{key} is not a key of robotd.toml"));
+            assert_eq!(
+                entry.kind,
+                crate::registry::Kind::OptionalPath,
+                "{key} must be a path slot"
+            );
+        }
+    }
+
+    /// A partial binding keeps the rest of its mode's default, an unknown nested key is dropped
+    /// rather than taking the bindings with it, and every out-of-range value is refused.
+    #[test]
+    fn controller_partial_overrides_and_invalid_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("robotd.toml");
+        std::fs::write(&path, "[pad_axes.drive.vyaw]\ngain = 0.5\n").unwrap();
+        let params = Params::load(&path, true).unwrap();
+        assert_eq!(params.pad_axes.drive.vyaw.gain, 0.5);
+        assert!(params.pad_axes.drive.vyaw.invert);
+        assert_eq!(
+            params.pad_axes.drive.vyaw.source,
+            pad_axes::AxisSource::RightX
+        );
+        // An unrelated future setting must not erase the recognized nested bindings.
+        std::fs::write(
+            &path,
+            "[pad_axes.drive.vyaw]\ngain = 0.5\nfuture_setting = true\n",
+        )
+        .unwrap();
+        assert_eq!(
+            Params::load(&path, true).unwrap().pad_axes.drive.vyaw.gain,
+            0.5
+        );
+        for text in [
+            "[pad_axes]\ndeadzone = 1.0",
+            "[pad_axes]\ndeadzone = nan",
+            "[pad_axes.drive.vx]\ngain = -1.0",
+            "[pad_axes.drive.vx]\ngain = inf",
+            "[pad_axes.drive.vx]\nsource = 'typo'",
+            "[pad_head]\nhead_yaw_max = -1.0",
+            "[pad_body]\nz_min = 0.01",
+            "[pad_roller]\nvx_max = -0.2",
+        ] {
+            std::fs::write(&path, text).unwrap();
+            assert!(Params::load(&path, true).is_err(), "accepted {text}");
+        }
+    }
+
+    /// **The set says what skills a robot has.** Adding a tenth policy used to mean two edits
+    /// in this repository and a daemon release to carry them; it is a tag on the Hub now.
+    #[test]
+    fn a_set_manifest_decides_which_policies_are_skills() {
+        let manifest: super::SetManifest = serde_json::from_value(serde_json::json!({
+            "policies": [
+                // A gait: perpetual, so not something to ask for by name.
+                { "file": "alpha_walking.onnx", "kind": "perpetual" },
+                // A perpetual one-shot: no length of its own, so it takes a config entry rather
+                // than appearing.
+                { "file": "flamingo.onnx", "kind": "perpetual",
+                  "unwind_s": 1.5, "command": { "idle": [0, 0, 0] } },
+                { "file": "roulade.onnx", "kind": "episodic", "duration_s": 1.0, "chain": true },
+                { "file": "ball_kick_left.onnx", "name": "kick_left",
+                  "kind": "episodic", "duration_s": 0.5 },
+                { "file": "new_trick.onnx", "kind": "episodic", "duration_s": 2.0,
+                  "action_scale": 0.8 }
+            ]
+        }))
+        .unwrap();
+
+        let skills: Vec<(&str, f64)> = manifest
+            .skills()
+            .map(|p| (p.file.as_str(), p.duration_s.unwrap()))
+            .collect();
+        assert_eq!(
+            skills,
+            vec![
+                ("roulade.onnx", 1.0),
+                ("ball_kick_left.onnx", 0.5),
+                ("new_trick.onnx", 2.0)
+            ],
+            "gaits and perpetual one-shots are not skills on their own"
+        );
+    }
+
+    /// **A set cannot shadow a skill the daemon drives itself.**
+    ///
+    /// The manifest lives on the Hub, so nothing in this repository can check it before a board
+    /// downloads it — the guard has to be on the board. `ground_pick` and `sit_toggle` have their
+    /// own arm of the cascade, and a set entry answering to either name would put a second
+    /// network behind it, fed an all-zero command it was never trained on.
+    ///
+    /// The guard is on the name, and this pins what that does and does not cover: a set that
+    /// mislabels a scripted policy without renaming it produces a junk skill under its own file
+    /// stem. That shadows nothing and is visible in `robotctl policy list`; catching it would
+    /// take a hardcoded list of our filenames, which is what this manifest exists to remove.
+    #[test]
+    fn a_set_cannot_shadow_a_skill_the_daemon_drives() {
+        let manifest: super::SetManifest = serde_json::from_value(serde_json::json!({
+            "policies": [
+                // Named as the daemon's own: shadowing, and refused.
+                { "file": "alpha_sitstand.onnx", "name": "sit_toggle",
+                  "kind": "episodic", "duration_s": 2.0 },
+                // Mislabelled but not renamed: a junk skill, and it is allowed through.
+                { "file": "alpha_ground_pick.onnx", "kind": "episodic", "duration_s": 4.0 },
+                // Labelled correctly: episodic on a phase command is the ground pick, and the
+                // encoding keeps it out of the skill list whatever it is called.
+                { "file": "roller_crouch.onnx", "name": "crouch", "kind": "episodic",
+                  "duration_s": 3.5, "mode": "roller",
+                  "command": { "encoding": "phase", "period_s": 5.0, "end_phase": 0.7 } },
+                { "file": "roulade.onnx", "kind": "episodic", "duration_s": 1.0 }
+            ]
+        }))
+        .unwrap();
+
+        let claimed: Vec<String> = manifest.skills().map(|p| p.skill_name()).collect();
+        assert_eq!(
+            claimed,
+            vec!["alpha_ground_pick".to_string(), "roulade".to_string()],
+            "sit_toggle is refused, the phase-encoded crouch is the ground pick; the mislabelled \
+             one is a visible mistake, not a trap"
+        );
+    }
+
+    /// A name is the role and a file is the training run, so `ball_kick_left.onnx` answers to
+    /// `kick_left` while `roulade.onnx` needs no name at all.
+    #[test]
+    fn a_set_policy_names_itself_after_its_file_unless_it_says_otherwise() {
+        let manifest: super::SetManifest = serde_json::from_value(serde_json::json!({
+            "policies": [
+                { "file": "roulade.onnx" },
+                { "file": "ball_kick_left.onnx", "name": "kick_left" }
+            ]
+        }))
+        .unwrap();
+        let names: Vec<String> = manifest.policies.iter().map(|p| p.skill_name()).collect();
+        assert_eq!(names, ["roulade", "kick_left"]);
+    }
+
+    /// A manifest that says nothing this build understands must not empty the robot. An older
+    /// set, or one written by a newer publisher, falls back rather than removing every skill.
+    #[test]
+    fn a_set_manifest_with_no_skills_falls_back() {
+        let manifest: super::SetManifest = serde_json::from_value(serde_json::json!({
+            "policies": [{ "file": "alpha_walking.onnx", "kind": "perpetual" }]
+        }))
+        .unwrap();
+        assert!(
+            manifest
+                .policies
+                .iter()
+                .all(|p| p.kind.as_deref() != Some("episodic")),
+            "nothing here is a skill, so builtin_skills keeps the three it knows"
+        );
+    }
+
+    /// The manifest the set actually publishes, as this build reads it. One place to see the
+    /// whole shape; the tests below take it apart.
+    fn published_set() -> super::SetManifest {
+        serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "policies": [
+                { "file": "alpha_walking.onnx", "kind": "perpetual" },
+                { "file": "alpha_stand.onnx",   "kind": "perpetual" },
+                { "file": "roller.onnx",        "kind": "perpetual", "mode": "roller",
+                  "action_scale": 0.8 },
+                { "file": "alpha_sitstand.onnx", "name": "sitstand", "kind": "scripted",
+                  "command": { "encoding": "posture_flag", "slot": "twist.vx",
+                               "sit": 1.0, "stand": 0.0, "idle": [0.0, 0.0, 0.0] },
+                  "ramp_s": 2.5, "unwind_s": 1.5 },
+                { "file": "alpha_ground_pick.onnx", "name": "ground_pick", "kind": "episodic",
+                  "duration_s": 2.8,
+                  "command": { "encoding": "phase", "slots": "twist.vx,twist.vy",
+                               "period_s": 4.0, "end_phase": 0.7 } },
+                { "file": "roller_crouch.onnx", "name": "crouch", "kind": "episodic",
+                  "duration_s": 3.5, "mode": "roller", "action_scale": 0.8,
+                  "command": { "encoding": "phase", "slots": "twist.vx,twist.vy",
+                               "period_s": 5.0, "end_phase": 0.7 } },
+                { "file": "roulade.onnx",         "kind": "episodic", "duration_s": 1.0,
+                  "chain": true },
+                { "file": "ball_kick_left.onnx",  "name": "kick_left",  "kind": "episodic",
+                  "duration_s": 0.5 },
+                { "file": "ball_kick_right.onnx", "name": "kick_right", "kind": "episodic",
+                  "duration_s": 0.5 }
+            ]
+        }))
+        .unwrap()
+    }
+
+    /// **The set says how fast its own ground pick runs, per mode.** The pick's cycle and the
+    /// crouch's were literals here — 4.0 and 3.0 — and the crouch is trained on a 5 s cycle, so
+    /// a board ran it at 3 s until somebody noticed. A phase-encoded episodic entry tagged with
+    /// a mode is that mode's ground pick, and its numbers are the defaults.
+    #[test]
+    fn the_set_declares_each_modes_ground_pick() {
+        let set = published_set();
+
+        let walk = super::PolicyParams::default().resolved_with(Some(&set));
+        assert_eq!(walk.ground_pick_period, 4.0);
+        assert_eq!(walk.ground_pick_end_phase, 0.7);
+        assert_eq!(
+            walk.ground_pick_action_scale, 1.0,
+            "the pick says nothing, mode default"
+        );
+
+        let roller = super::PolicyParams {
+            mode: super::Mode::Roller,
+            ..Default::default()
+        }
+        .resolved_with(Some(&set));
+        assert_eq!(
+            roller.ground_pick_period, 5.0,
+            "the crouch's own cycle, not the literal"
+        );
+        assert_eq!(roller.ground_pick_action_scale, 0.8);
+        assert!(
+            roller.ground_pick.unwrap().ends_with("roller_crouch.onnx"),
+            "and the slot still loads the crouch"
+        );
+    }
+
+    /// The file is a list of decisions: a `[policy]` key still beats the set.
+    #[test]
+    fn a_config_key_overrides_the_sets_ground_pick_timing() {
+        let set = published_set();
+        let tuned = super::PolicyParams {
+            mode: super::Mode::Roller,
+            ground_pick_period: Some(6.0),
+            ground_pick_action_scale: Some(0.7),
+            ..Default::default()
+        }
+        .resolved_with(Some(&set));
+        assert_eq!(tuned.ground_pick_period, 6.0);
+        assert_eq!(tuned.ground_pick_action_scale, 0.7);
+        assert_eq!(
+            tuned.ground_pick_end_phase, 0.7,
+            "there is no key for the cutoff"
+        );
+    }
+
+    /// **The set says how the sit↔stand is timed.** The rise was a literal second and the
+    /// shutdown sit a literal four; the scripted posture-flag entry carries both.
+    #[test]
+    fn the_set_declares_the_sitstands_timing() {
+        let set = published_set();
+        let resolved = super::PolicyParams::default().resolved_with(Some(&set));
+        assert_eq!(resolved.sitstand_rise_s, 1.5);
+        assert_eq!(resolved.sitstand_ramp_s, 2.5);
+        assert!(
+            resolved.sitstand.unwrap().ends_with("alpha_sitstand.onnx"),
+            "scripted is recorded, not turned into a skill"
+        );
+    }
+
+    /// **A phase-encoded or posture-flag policy is never a zero-command skill.** Both are driven
+    /// by the daemon through commands it generates; loading either as a generic one-shot would
+    /// run it on all-zeros. The published set's skills are exactly the three the prototype had.
+    #[test]
+    fn the_published_set_yields_the_three_skills_and_nothing_else() {
+        let set = published_set();
+        let resolved = super::PolicyParams::default().resolved_with(Some(&set));
+        let names: Vec<&str> = resolved.skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["roulade", "kick_left", "kick_right"]);
+        let roulade = &resolved.skills[0];
+        assert_eq!(roulade.duration, 1.0);
+        assert!(roulade.chain);
+    }
+
+    /// **Absence is the prototype.** No manifest, or one that predates these fields, resolves to
+    /// the literals the daemon has always used — a board is never left with a pick that will not
+    /// end or a rise that never hands back.
+    #[test]
+    fn a_set_that_says_nothing_about_timing_leaves_the_prototypes_numbers() {
+        let old: super::SetManifest = serde_json::from_value(serde_json::json!({
+            "policies": [
+                { "file": "alpha_ground_pick.onnx", "kind": "scripted" },
+                { "file": "roller_crouch.onnx", "kind": "scripted" },
+                { "file": "alpha_sitstand.onnx", "kind": "perpetual" },
+                { "file": "roulade.onnx", "kind": "episodic", "duration_s": 1.0, "chain": true }
+            ]
+        }))
+        .unwrap();
+        for manifest in [None, Some(&old)] {
+            let walk = super::PolicyParams::default().resolved_with(manifest);
+            assert_eq!(walk.ground_pick_period, 4.0);
+            assert_eq!(
+                walk.ground_pick_end_phase,
+                super::DEFAULT_GROUND_PICK_END_PHASE
+            );
+            assert_eq!(walk.ground_pick_action_scale, 1.0);
+            assert_eq!(walk.sitstand_rise_s, super::DEFAULT_SITSTAND_RISE_S);
+            assert_eq!(walk.sitstand_ramp_s, super::DEFAULT_SITSTAND_RAMP_S);
+            let roller = super::PolicyParams {
+                mode: super::Mode::Roller,
+                ..Default::default()
+            }
+            .resolved_with(manifest);
+            assert_eq!(roller.ground_pick_period, 3.0);
+            assert_eq!(roller.ground_pick_action_scale, 0.8);
+        }
+    }
+
+    /// A phase entry with a `period_s` but no `encoding` is still a phase entry — the field
+    /// means nothing else — and one with no `end_phase` hands back at the prototype's cutoff.
+    #[test]
+    fn a_period_alone_makes_a_phase_entry() {
+        let set: super::SetManifest = serde_json::from_value(serde_json::json!({
+            "policies": [
+                { "file": "alpha_ground_pick.onnx", "kind": "episodic", "duration_s": 3.5,
+                  "command": { "period_s": 5.0 } }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            set.ground_pick(super::Mode::Walk),
+            Some(super::PhaseTiming {
+                period_s: 5.0,
+                end_phase: 0.7,
+                action_scale: None
+            })
+        );
+        assert_eq!(set.skills().count(), 0, "not a zero-command skill");
+        assert_eq!(
+            set.ground_pick(super::Mode::Roller),
+            None,
+            "untagged means walking"
+        );
+    }
+
+    /// The shipped mapping: A sits, B picks up, the bumpers say yes and no, Y is excited, X is free.
+    #[test]
+    fn the_default_bindings() {
+        let pad = super::PadParams::default();
+        assert_eq!(pad.a, "sit_toggle");
+        assert_eq!(pad.b, "ground_pick");
+        assert_eq!(pad.x, "");
+        assert_eq!(pad.y, "excited");
+        assert_eq!(pad.lb, "yes");
+        assert_eq!(pad.rb, "no");
+    }
+
+    /// **The D-pad stopped being bindable, and a robot still carrying the old key boots.** It is
+    /// an unknown key now, so it is ignored and named rather than refusing the whole file.
+    #[test]
+    fn the_retired_dpad_down_binding_is_ignored_and_named() {
+        let (_, ignored) =
+            super::without_unknown_keys("[pad]\ndpad_down = \"sit_toggle\"\n").unwrap();
+        assert_eq!(ignored, ["pad.dpad_down"]);
+    }
+
+    /// Binding one button leaves the rest alone — the file is a list of decisions, and rebinding
+    /// X must not silently take the ground pick off B.
+    #[test]
+    fn binding_one_button_leaves_the_others() {
+        let params: super::Params =
+            toml::from_str("[pad]\nx = \"polite-bow\"\n").expect("a pad section");
+        assert_eq!(params.pad.x, "polite-bow");
+        assert_eq!(params.pad.b, "ground_pick", "untouched");
+        assert_eq!(params.pad.a, "sit_toggle", "untouched");
+    }
+
+    /// An empty binding is a button switched off on purpose, which is different from a button
+    /// bound to something that does not exist — `padd` sends nothing rather than a bad name.
+    #[test]
+    fn an_empty_binding_is_a_button_switched_off() {
+        let params: super::Params = toml::from_str("[pad]\nb = \"\"\n").unwrap();
+        assert_eq!(params.pad.skill("b"), Some(""));
+        assert_eq!(params.pad.skill("nonsense"), None, "not a button at all");
+    }
+
+    /// Every bindable button must be reachable through the accessors, or `robotctl pad bind`
+    /// would refuse a button the config file happily accepts.
+    #[test]
+    fn every_listed_button_can_be_read_and_bound() {
+        let mut pad = super::PadParams::default();
+        for button in super::PadParams::BUTTONS {
+            assert!(pad.skill(button).is_some(), "{button} is not readable");
+            assert!(pad.bind(button, "polite-bow"), "{button} is not bindable");
+            assert_eq!(pad.skill(button), Some("polite-bow"));
+        }
+        assert!(!pad.bind("triangle", "x"), "and nothing else is");
+    }
+
+    /// **Absence resolves to the three a robot has always had.** A board updating onto this
+    /// writes no config and runs no migration, and still has its kicks and its roulade.
+    #[test]
+    fn no_configured_skills_means_the_built_in_three() {
+        let resolved = super::PolicyParams::default().resolved();
+        let names: Vec<&str> = resolved.skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["roulade", "kick_left", "kick_right"]);
+        assert!(
+            resolved.skills.iter().all(|s| s.resolved_path().is_some()),
+            "each names a file"
+        );
+    }
+
+    /// Adding one skill does not mean re-declaring the others — the file is a list of decisions.
+    /// A rule where config replaced the lot would make forgetting an entry a silent removal.
+    #[test]
+    fn a_new_skill_is_added_without_re_declaring_the_built_ins() {
+        use std::path::PathBuf;
+
+        let params = super::PolicyParams {
+            skills: vec![super::SkillDef {
+                name: "polite-bow".into(),
+                path: Some(PathBuf::from(
+                    "/var/lib/robot/policies/x/y/main/policy.onnx",
+                )),
+                duration: 4.0,
+                chain: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let names: Vec<String> = params
+            .resolved()
+            .skills
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        assert_eq!(names, ["roulade", "kick_left", "kick_right", "polite-bow"]);
+    }
+
+    /// Naming a built-in changes it and keeps its place in the priority order — a retuned
+    /// roulade must not become the last thing the cascade considers.
+    #[test]
+    fn naming_a_built_in_retunes_it_in_place() {
+        let params = super::PolicyParams {
+            skills: vec![super::SkillDef {
+                name: "roulade".into(),
+                path: None,
+                duration: 2.5,
+                chain: false,
+                params: super::SkillOverrides {
+                    action_scale: Some(0.7),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let resolved = params.resolved();
+        assert_eq!(resolved.skills[0].name, "roulade", "still first");
+        assert_eq!(resolved.skills[0].duration, 2.5);
+        assert_eq!(resolved.skills[0].params.action_scale, Some(0.7));
+        assert_eq!(resolved.skills.len(), 3, "and nothing was added");
+    }
+
+    /// The `"none"` sentinel removes a built-in, so taking one away needs no second mechanism —
+    /// it is the same word that switches off a policy slot.
+    #[test]
+    fn a_built_in_can_be_switched_off_by_name() {
+        use std::path::PathBuf;
+
+        let params = super::PolicyParams {
+            skills: vec![super::SkillDef {
+                name: "kick_left".into(),
+                path: Some(PathBuf::from("none")),
+                duration: 0.5,
+                chain: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let names: Vec<String> = params
+            .resolved()
+            .skills
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        assert_eq!(names, ["roulade", "kick_right"]);
+    }
+
+    /// A skill with no path runs `<name>.onnx` from this robot's own set, so a built-in needs no
+    /// path written and a fetched one carries what `policy load` recorded.
+    #[test]
+    fn a_skill_without_a_path_runs_its_own_name() {
+        let resolved = super::PolicyParams::default().resolved();
+        let roulade = &resolved.skills[0];
+        assert_eq!(
+            roulade.resolved_path().unwrap(),
+            std::path::Path::new(super::POLICY_DIR).join("roulade.onnx")
+        );
+        // The kicks are the exception the built-ins spell out: their files are named for the
+        // training run, not the role.
+        let kick = resolved
+            .skills
+            .iter()
+            .find(|s| s.name == "kick_left")
+            .unwrap();
+        assert!(
+            kick.resolved_path()
+                .unwrap()
+                .ends_with("ball_kick_left.onnx"),
+            "{:?}",
+            kick.resolved_path()
+        );
+    }
+
+    /// **A skill slot is the file the skill runs.** `robotctl policy load roulade <file>` writes
+    /// `[policy] roulade`, and until this the daemon reported that file in the slot while the
+    /// `roulade` skill went on running the built-in — a load that changed the report and nothing
+    /// else.
+    #[test]
+    fn a_skill_slot_override_is_what_the_skill_runs() {
+        use std::path::PathBuf;
+
+        let params = super::PolicyParams {
+            roulade: Some(PathBuf::from("/srv/roll.onnx")),
+            kick_left: Some(PathBuf::from("/srv/left.onnx")),
+            ..Default::default()
+        };
+        let resolved = params.resolved();
+
+        let file = |name: &str| {
+            resolved
+                .skills
+                .iter()
+                .find(|s| s.name == name)
+                .and_then(|s| s.resolved_path())
+        };
+        assert_eq!(file("roulade"), Some(PathBuf::from("/srv/roll.onnx")));
+        assert_eq!(file("kick_left"), Some(PathBuf::from("/srv/left.onnx")));
+        assert!(
+            file("kick_right")
+                .unwrap()
+                .ends_with("ball_kick_right.onnx"),
+            "an untouched slot keeps the built-in"
+        );
+        // And the report agrees with the list, in both directions.
+        assert_eq!(resolved.roulade, file("roulade"));
+        assert_eq!(resolved.kick_left, file("kick_left"));
+        assert_eq!(resolved.kick_right, file("kick_right"));
+    }
+
+    /// The slot beats a `[[policy.skill]]` entry of the same name: `policy load` is the later,
+    /// more explicit decision, and it keeps the entry's timing.
+    #[test]
+    fn a_skill_slot_overrides_the_entry_path_and_keeps_its_timing() {
+        use std::path::PathBuf;
+
+        let params = super::PolicyParams {
+            roulade: Some(PathBuf::from("/srv/roll.onnx")),
+            skills: vec![super::SkillDef {
+                name: "roulade".into(),
+                path: Some(PathBuf::from("/srv/other.onnx")),
+                duration: 2.5,
+                chain: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let roulade = params
+            .resolved()
+            .skills
+            .into_iter()
+            .find(|s| s.name == "roulade")
+            .unwrap();
+        assert_eq!(roulade.path, Some(PathBuf::from("/srv/roll.onnx")));
+        assert_eq!(roulade.duration, 2.5);
+    }
+
+    /// `"none"` in a skill slot switches the skill off, exactly as it does in the entry.
+    #[test]
+    fn a_skill_slot_set_to_none_removes_the_skill() {
+        use std::path::PathBuf;
+
+        let params = super::PolicyParams {
+            kick_right: Some(PathBuf::from("none")),
+            ..Default::default()
+        };
+        let resolved = params.resolved();
+        let names: Vec<&str> = resolved.skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["roulade", "kick_left"]);
+        assert_eq!(resolved.kick_right, None, "and the report says so");
+    }
+
+    /// **A policy that does not end itself needs the daemon to end it.**
+    ///
+    /// `polite-bow` is episodic: four seconds later it is standing again, so the window simply
+    /// expires and walk takes over a robot that is upright. The published flamingo is not — it
+    /// holds a foot up until told otherwise — and handing back mid-hold would give walk a robot
+    /// balanced on one leg. `unwind` is the daemon supplying the ending, which is what makes a
+    /// perpetual policy usable as a one-shot at all.
+    #[test]
+    fn a_skill_can_declare_how_it_comes_back() {
+        let params = super::PolicyParams {
+            skills: vec![super::SkillDef {
+                name: "flamingo".into(),
+                path: Some(std::path::PathBuf::from("/srv/flamingo.onnx")),
+                duration: 5.0,
+                chain: false,
+                // [flag, side, 0]: lift, then stand back on two feet before handing over.
+                command: [1.0, 1.0, 0.0],
+                unwind: [0.0, 1.0, 0.0],
+                unwind_s: 3.0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let resolved = params.resolved();
+        let flamingo = resolved.skills.last().unwrap();
+        assert_eq!(flamingo.command, [1.0, 1.0, 0.0]);
+        assert_eq!(flamingo.unwind, [0.0, 1.0, 0.0]);
+        assert_eq!(flamingo.unwind_s, 3.0);
+    }
+
+    /// And the common case declares none of it. A zero command with no unwind is what every
+    /// one-shot published so far is, and writing that out would be noise in every config file.
+    #[test]
+    fn the_built_ins_need_no_command_or_unwind() {
+        for skill in super::PolicyParams::default().resolved().skills {
+            assert_eq!(skill.command, [0.0; 3], "{} drives on zeros", skill.name);
+            assert_eq!(skill.unwind_s, 0.0, "{} ends itself", skill.name);
+        }
+    }
+
+    /// **A config that disables the walking slot must not panic.**
+    ///
+    /// It reached a board: `robotctl policy load walk none` wrote `walk = "none"`, and resolving
+    /// that killed the control thread — the daemon stayed up answering its socket while the robot
+    /// stopped ticking, and a restart panicked again at startup because the file still said it.
+    /// One line in a config file must never be able to do that.
+    #[test]
+    fn disabling_the_walking_slot_falls_back_rather_than_panicking() {
+        use super::{Mode, PolicyParams, Slot};
+        use std::path::PathBuf;
+
+        for mode in [Mode::Walk, Mode::Roller] {
+            let mut params = PolicyParams {
+                mode,
+                ..Default::default()
+            };
+            params.set_slot(Slot::Walk, Some(PathBuf::from("none")));
+            let resolved = params.resolved();
+            assert!(
+                resolved.walk.starts_with(super::POLICY_DIR),
+                "{mode:?} must fall back to its own walking policy, got {}",
+                resolved.walk.display()
+            );
+        }
+    }
+
+    /// Every *other* slot may legitimately be switched off, which is what running a community
+    /// policy that owns the whole command block needs. Only `walk` is special.
+    #[test]
+    fn every_other_slot_can_be_switched_off() {
+        use super::{PolicyParams, Slot};
+        use std::path::PathBuf;
+
+        let mut params = PolicyParams::default();
+        for slot in Slot::ALL {
+            params.set_slot(slot, Some(PathBuf::from("none")));
+        }
+        let resolved = params.resolved();
+        for slot in Slot::ALL {
+            if slot == Slot::Walk {
+                continue;
+            }
+            assert_eq!(resolved.slot(slot), None, "{slot} must be off");
+        }
+    }
+
+    /// **The default policy path must not be inside the release directory.**
+    ///
+    /// That coupling is the whole thing this move undoes: while it held, a gait retrain needed a
+    /// daemon release and a daemon fix re-shipped six megabytes of unchanged weights. It would
+    /// also come back silently — a default rewritten in terms of `RELEASE_DIR` still resolves to
+    /// a real file on a real board, and nothing else would notice.
+    #[test]
+    fn the_default_policies_live_outside_the_release() {
+        let resolved = super::PolicyParams::default().resolved();
+        for slot in super::Slot::ALL {
+            let Some(path) = resolved.slot(slot) else {
+                continue;
+            };
+            assert!(
+                path.starts_with(super::POLICY_DIR),
+                "{slot} resolves to {}",
+                path.display()
+            );
+            assert!(
+                !path.starts_with(super::RELEASE_DIR),
+                "{slot} is back inside the release: {}",
+                path.display()
+            );
+        }
+    }
+
+    /// Round-tripping every slot through its own name, so a rename cannot half-land: `parse`
+    /// and `as_str` disagreeing would make a slot loadable under a name nothing reports.
+    #[test]
+    fn slot_names_round_trip() {
+        for slot in super::Slot::ALL {
+            assert_eq!(super::Slot::parse(slot.as_str()), Some(slot));
+        }
+        assert_eq!(super::Slot::parse("groundpick"), None);
+        assert_eq!(super::Slot::parse(""), None);
+    }
+
+    /// The accessors have to agree with `resolved()`, which is the function everything
+    /// downstream actually consumes. A `slot()` that read the wrong field would report one
+    /// policy while the loop ran another.
+    #[test]
+    fn slot_accessors_agree_with_the_resolved_paths() {
+        use super::{PolicyParams, Slot};
+        use std::path::PathBuf;
+
+        let mut params = PolicyParams::default();
+        for slot in Slot::ALL {
+            params.set_slot(slot, Some(PathBuf::from(format!("/tmp/{slot}.onnx"))));
+        }
+        let resolved = params.resolved();
+        for slot in Slot::ALL {
+            assert_eq!(
+                params.slot(slot).as_deref(),
+                Some(std::path::Path::new(&format!("/tmp/{slot}.onnx"))),
+                "{slot} reads back what was set"
+            );
+            assert_eq!(
+                resolved.slot(slot),
+                Some(std::path::Path::new(&format!("/tmp/{slot}.onnx"))),
+                "{slot} resolves to its override"
+            );
+        }
+    }
+
+    /// Clearing an override must fall back to the mode's default rather than emptying the slot —
+    /// that is the whole of `policy reset`, and getting it wrong would leave a robot with no gait
+    /// after an undo.
+    #[test]
+    fn clearing_a_slot_falls_back_to_the_mode_default() {
+        use super::{PolicyParams, Slot};
+        use std::path::PathBuf;
+
+        let mut params = PolicyParams::default();
+        params.set_slot(Slot::Walk, Some(PathBuf::from("/tmp/mine.onnx")));
+        assert!(params.resolved().walk.ends_with("mine.onnx"));
+
+        params.set_slot(Slot::Walk, None);
+        assert_eq!(
+            params.resolved().walk,
+            std::path::Path::new(super::POLICY_DIR).join("velstand.onnx"),
+            "reset must restore the default, not empty the slot"
+        );
+    }
+
     use super::*;
 
     fn write(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
@@ -1338,6 +4497,43 @@ mod tests {
         assert_eq!(spelled_out.capture_device(), "plughw:aic3104,0");
     }
 
+    /// A board without the configured card plays and records on ALSA's `default`, which the
+    /// board's own ALSA configuration routes; one with it is untouched.
+    #[test]
+    fn a_missing_audio_card_falls_back_to_the_alsa_default() {
+        let beta = alsa_card_ids(concat!(
+            " 0 [rockchiprk809  ]: simple-card - rockchip-rk809\n",
+            "                      rockchip-rk809\n",
+            " 1 [facemic        ]: simple-card - face-mic\n",
+            "                      face-mic\n",
+        ));
+        assert_eq!(beta, ["rockchiprk809", "facemic"]);
+
+        let params = AudioParams::default();
+        let resolved = params.resolve_devices(&beta);
+        assert_eq!(resolved.playback, "default");
+        assert_eq!(resolved.capture, "default");
+        assert_eq!(resolved.missing_card.as_deref(), Some("aic3104"));
+
+        let zero3 = alsa_card_ids(" 0 [aic3104        ]: simple-card - aic3104\n");
+        let resolved = params.resolve_devices(&zero3);
+        assert_eq!(resolved.playback, "plughw:aic3104");
+        assert_eq!(resolved.capture, "plughw:aic3104,0");
+        assert_eq!(resolved.missing_card, None);
+
+        // Spellings that name a card are checked; ones that do not are used as written.
+        assert_eq!(named_card("plughw:CARD=aic3104,DEV=0"), Some("aic3104"));
+        assert_eq!(named_card("hw:aic3104,0"), Some("aic3104"));
+        assert_eq!(named_card("hw:1,0"), None);
+        assert_eq!(named_card("default"), None);
+        assert_eq!(named_card("dmix:aic3104"), None);
+        let custom = AudioParams {
+            device: "speaker".to_owned(),
+            ..AudioParams::default()
+        };
+        assert_eq!(custom.resolve_devices(&[]).playback, "speaker");
+    }
+
     /// An unprovisioned board must still come up. A daemon that refuses to start because a
     /// config file is absent is far harder to diagnose on a robot than one running on
     /// documented defaults.
@@ -1356,6 +4552,134 @@ mod tests {
         assert!(Params::load(&dir.path().join("absent.toml"), true).is_err());
     }
 
+    /// Both layers in one directory, as `Params::load_layered` takes them.
+    fn layers(dir: &std::path::Path, base: &str, user: Option<&str>) -> (PathBuf, PathBuf) {
+        let base_path = dir.join("base.toml");
+        let user_path = dir.join("user.toml");
+        std::fs::write(&base_path, base).unwrap();
+        if let Some(user) = user {
+            std::fs::write(&user_path, user).unwrap();
+        }
+        (base_path, user_path)
+    }
+
+    /// The whole point of the user layer: what the owner set wins, key by key, and what the
+    /// image set and the owner did not touch is still the image's — so the next image can move
+    /// it.
+    #[test]
+    fn the_user_layer_wins_key_by_key_over_the_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, user) = layers(
+            dir.path(),
+            "[bus]\nport = \"/dev/ttyS2\"\n[control]\nhz = 50\n",
+            Some("[control]\nhz = 100\n"),
+        );
+        let p = Params::load_layered(&base, &user, true).unwrap();
+        assert_eq!(p.control.hz, 100, "the user's value");
+        assert_eq!(
+            p.bus.port, "/dev/ttyS2",
+            "the base's, untouched by the user"
+        );
+        assert!(p.user_layer_rejected.is_none());
+    }
+
+    #[test]
+    fn no_user_layer_is_the_base_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, user) = layers(dir.path(), "[control]\nhz = 75\n", None);
+        let p = Params::load_layered(&base, &user, true).unwrap();
+        assert_eq!(p.control.hz, 75);
+        assert!(p.user_layer_rejected.is_none());
+    }
+
+    /// A broken user layer must not take the robot down: it would take the update path down
+    /// with it, and no update replaces this file any more. The base runs, and the reason is
+    /// kept for `robotd`'s health to report — naming the file somebody has to fix.
+    #[test]
+    fn a_user_layer_that_does_not_parse_is_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, user) = layers(
+            dir.path(),
+            "[control]\nhz = 75\n",
+            Some("[control\nhz = 100\n"),
+        );
+        let p = Params::load_layered(&base, &user, true).expect("the robot still starts");
+        assert_eq!(p.control.hz, 75, "the base alone");
+        let why = p.user_layer_rejected.expect("and says why");
+        assert!(why.contains("user.toml"), "names the file to fix: {why}");
+    }
+
+    /// Validation runs on the merged robot, not on either half: `hz = 0` parses fine and is
+    /// still a loop that cannot run.
+    #[test]
+    fn a_user_layer_that_fails_validation_is_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, user) = layers(
+            dir.path(),
+            "[control]\nhz = 75\n",
+            Some("[control]\nhz = 0\n"),
+        );
+        let p = Params::load_layered(&base, &user, true).unwrap();
+        assert_eq!(p.control.hz, 75);
+        assert!(p.user_layer_rejected.is_some());
+    }
+
+    /// The base is the image's, and an image that ships a broken one is a broken image: that
+    /// stays fatal, exactly as a broken single file was.
+    #[test]
+    fn a_broken_base_is_still_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, user) = layers(dir.path(), "[control\n", Some("[control]\nhz = 100\n"));
+        assert!(Params::load_layered(&base, &user, true).is_err());
+    }
+
+    /// An image that still writes a section under its old name, under a user layer written by an
+    /// editor that uses the new one, is one section — not a duplicate the loader refuses.
+    #[test]
+    fn renamed_sections_merge_across_layers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, user) = layers(
+            dir.path(),
+            "[imu_head]\nenabled = true\n",
+            Some("[pad_imu_head_control]\ngain = 0.5\n"),
+        );
+        let p = Params::load_layered(&base, &user, true).unwrap();
+        assert!(
+            p.pad_imu_head_control.enabled,
+            "from the base, under its old name"
+        );
+        assert_eq!(p.pad_imu_head_control.gain, 0.5, "from the user layer");
+        assert!(p.user_layer_rejected.is_none());
+    }
+
+    /// A list replaces, it does not merge: otherwise a user layer could add a skill and never
+    /// remove one.
+    #[test]
+    fn a_user_list_replaces_the_base_list() {
+        let base: toml::Table = "[policy]\n[[policy.skill]]\nname = \"a\"\nduration = 1.0\n\
+                                 [[policy.skill]]\nname = \"b\"\nduration = 1.0\n"
+            .parse()
+            .unwrap();
+        let user: toml::Table = "[[policy.skill]]\nname = \"b\"\nduration = 2.0\n"
+            .parse()
+            .unwrap();
+        let merged = merge_layers(base, user);
+        let skills = merged["policy"]["skill"].as_array().unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0]["name"].as_str(), Some("b"));
+    }
+
+    /// Only the provisioned path is layered. A file somebody named — a simulated duck's, a
+    /// bench override — means exactly what it says.
+    #[test]
+    fn only_the_provisioned_path_has_a_user_layer() {
+        assert_eq!(
+            user_layer_for(Path::new(DEFAULT_PATH)),
+            Some(PathBuf::from(USER_PATH))
+        );
+        assert_eq!(user_layer_for(Path::new("/tmp/duck-sim/robotd.toml")), None);
+    }
+
     /// Partial files are the normal case — a board overrides the port and nothing else.
     #[test]
     fn absent_sections_take_their_defaults() {
@@ -1370,6 +4694,35 @@ mod tests {
     /// [`QUALITY_LABELS`] is what the registry offers and what the file may contain, and
     /// [`Quality::ALL`] is what the daemon can do — a rung in one and not the other is either a
     /// choice the editor writes and `mediad` cannot read, or a mode nobody can select.
+    /// **An absent `[media.intrinsics]` stays `None`.** Only a per-robot solve goes in the config;
+    /// the family calibration is `mediad`'s fallback, so that `Some` here means, unambiguously,
+    /// that this robot was measured — which is what lets `media.video` tag `source: "robot"` versus
+    /// `"family"`. `CameraIntrinsics::alpha` is still the family solve `mediad` reads.
+    #[test]
+    fn an_absent_intrinsics_table_is_none_not_the_family() {
+        assert_eq!(MediaParams::default().intrinsics, None);
+
+        let parsed: Params = toml::from_str("[media]\nbitrate = 2000\n").expect("parses");
+        assert_eq!(parsed.media.intrinsics, None, "absent key");
+        let parsed: Params = toml::from_str("").expect("parses");
+        assert_eq!(parsed.media.intrinsics, None, "absent table");
+
+        // The family solve is a real calibration, just not stored here.
+        assert_eq!(CameraIntrinsics::alpha().width, 1280);
+
+        let parsed: Params = toml::from_str(
+            "[media.intrinsics]\nwidth = 640\nheight = 360\nfx = 500.0\nfy = 501.0\ncx = 320.0\ncy = 180.0\n",
+        )
+        .expect("parses");
+        let own = parsed.media.intrinsics.expect("this robot's own");
+        assert_eq!(
+            (own.width, own.fx),
+            (640, 500.0),
+            "a written table is this robot's own solve"
+        );
+        assert!(own.distortion.is_empty());
+    }
+
     #[test]
     fn every_quality_label_round_trips() {
         assert_eq!(QUALITY_LABELS.len(), Quality::ALL.len());
@@ -1379,6 +4732,80 @@ mod tests {
                 toml::from_str(&format!("[media]\nquality = \"{label}\"\n")).expect("parses");
             assert_eq!(parsed.media.quality, quality);
         }
+    }
+
+    /// [`MEDIA_SOURCE_LABELS`] is what the registry offers and what the file may contain, and
+    /// [`MediaSource::ALL`] is what `mediad` can build. A name in one and not the other is either
+    /// a choice the editor writes and `mediad` cannot read, or a source nobody can select.
+    #[test]
+    fn every_media_source_label_round_trips() {
+        assert_eq!(MEDIA_SOURCE_LABELS.len(), MediaSource::ALL.len());
+        for (label, source) in MEDIA_SOURCE_LABELS.iter().zip(MediaSource::ALL) {
+            assert_eq!(*label, source.label());
+            let parsed: Params =
+                toml::from_str(&format!("[media]\nsource = \"{label}\"\n")).expect("parses");
+            assert_eq!(parsed.media.source, source);
+        }
+    }
+
+    #[test]
+    fn every_media_sensor_label_round_trips() {
+        assert_eq!(MEDIA_SENSOR_LABELS.len(), MediaSensor::ALL.len());
+        for (label, sensor) in MEDIA_SENSOR_LABELS.iter().zip(MediaSensor::ALL) {
+            assert_eq!(*label, sensor.label());
+            let parsed: Params =
+                toml::from_str(&format!("[media]\nsensor = \"{label}\"\n")).expect("parses");
+            assert_eq!(parsed.media.sensor, sensor);
+            if let Some(forced) = sensor.forced() {
+                assert_eq!(
+                    forced.label(),
+                    *label,
+                    "a forced choice is the sensor's own name"
+                );
+            }
+        }
+    }
+
+    /// The board decides unless a sensor is named, and an unset key is `board`.
+    #[test]
+    fn the_head_camera_is_the_boards_unless_forced() {
+        use board::Board;
+        let unset: Params = toml::from_str("").unwrap();
+        assert_eq!(unset.media.sensor, MediaSensor::Board);
+        assert_eq!(
+            MediaSensor::Board.resolve(Board::Zero3),
+            CameraSensor::Imx219
+        );
+        assert_eq!(
+            MediaSensor::Board.resolve(Board::Beta),
+            CameraSensor::Gc2093
+        );
+        assert_eq!(
+            MediaSensor::Imx219.resolve(Board::Beta),
+            CameraSensor::Imx219
+        );
+    }
+
+    /// **The key that was replaced must not come back as a silent default.** A robot carrying the
+    /// old `camera = false` gets the unknown-key warning and this build's default — the camera —
+    /// which is a board that starts using a camera it may not have. Better than refusing to boot
+    /// over an inert key (the `[chorale]` rule), and only defensible if the warning names it, so
+    /// this pins that the key is *ignored* rather than parsed into something.
+    #[test]
+    fn the_retired_camera_boolean_is_ignored_and_named() {
+        let (_, ignored) = without_unknown_keys("[media]\ncamera = false\n").unwrap();
+        assert_eq!(ignored, ["media.camera"]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "[media]\ncamera = false\n");
+        let media = Params::load(&path, true)
+            .expect("an inert key must not stop the robot")
+            .media;
+        assert_eq!(
+            media.source,
+            MediaSource::Camera,
+            "the retired key must not still be steering the source"
+        );
     }
 
     /// The labels are `webrtcsink`'s own property nicknames — the strings that get set on the
@@ -1415,6 +4842,321 @@ mod tests {
         assert_eq!(media.bitrate_resolved(), 3_000_000);
     }
 
+    /// **A camera runs at the configured rung and a test pattern does not**, which is the whole
+    /// of [`MediaParams::geometry`]. Every rung, so a `quality` edit cannot start reaching the
+    /// pattern by accident.
+    #[test]
+    fn only_a_camera_runs_at_the_configured_quality() {
+        let mut media = MediaParams::default();
+        for quality in Quality::ALL {
+            media.quality = quality;
+
+            media.source = MediaSource::Camera;
+            assert_eq!(
+                media.geometry(),
+                (quality.width(), quality.height(), quality.fps()),
+                "a camera streams {}",
+                quality.label()
+            );
+
+            media.source = MediaSource::Test;
+            assert_eq!(
+                media.geometry(),
+                TEST_PATTERN_GEOMETRY,
+                "a test pattern ignores {}",
+                quality.label()
+            );
+        }
+    }
+
+    /// The pattern's geometry has to satisfy the same two constraints every [`Quality`] rung does
+    /// — 16:9, and both axes a multiple of 8 for the encoder's macroblocks — because it goes
+    /// through the same capsfilter and the same encoder. A rate of zero would be a still image.
+    #[test]
+    fn the_test_pattern_is_16_9_and_encodable() {
+        let (width, height, fps) = TEST_PATTERN_GEOMETRY;
+        assert_eq!(width % 8, 0, "width {width} is not a multiple of 8");
+        assert_eq!(height % 8, 0, "height {height} is not a multiple of 8");
+        assert_eq!(width * 9, height * 16, "{width}x{height} is not 16:9");
+        assert!(fps > 0, "a test pattern with no frame rate is a photograph");
+
+        // And it is worth having: a pattern as expensive as the rung it replaces would be this
+        // constant written the long way.
+        let (w, h, f) = MediaParams {
+            source: MediaSource::Camera,
+            ..MediaParams::default()
+        }
+        .geometry();
+        assert!(
+            width * height * fps * 4 < w * h * f,
+            "{width}x{height}@{fps} is not materially cheaper than the default {w}x{h}@{f}"
+        );
+    }
+
+    /// A `_min` written as a magnitude would turn full stick back into walking forward. Refused,
+    /// and so `robotctl configure` cannot write it.
+    #[test]
+    fn a_positive_pad_drive_min_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "[pad_drive]\nvx_min = 0.2\n");
+        let error = Params::load(&path, true).expect_err("refused").to_string();
+        assert!(error.contains("pad_drive.vx_min"), "{error}");
+
+        let path = write(dir.path(), "[pad_drive]\nvyaw_max = -1.0\n");
+        assert!(Params::load(&path, true).is_err());
+
+        // Zero is a direction switched off, which is a thing somebody might want.
+        let path = write(dir.path(), "[pad_drive]\nvx_min = 0.0\nvy_min = -0.1\n");
+        let params = Params::load(&path, true).expect("valid");
+        assert_eq!(params.pad_drive.vx_min, 0.0);
+        assert_eq!(params.pad_drive.vy_min, -0.1);
+    }
+
+    /// The cap is a divisor and a promise about latency: zero divides by it, and a rate above
+    /// what a pad link carries only spends the robot's socket.
+    #[test]
+    fn netpad_max_hz_outside_ten_to_a_hundred_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for bad in ["0", "9", "101"] {
+            let path = write(dir.path(), &format!("[netpad]\nmax_hz = {bad}\n"));
+            let error = Params::load(&path, true).expect_err("refused").to_string();
+            assert!(error.contains("netpad.max_hz"), "{error}");
+        }
+        for good in [10, 100] {
+            let path = write(dir.path(), &format!("[netpad]\nmax_hz = {good}\n"));
+            assert_eq!(
+                Params::load(&path, true).expect("valid").netpad.max_hz,
+                good
+            );
+        }
+    }
+
+    /// A stale limit at or past the deadman would keep re-sending a stalled client's last stick
+    /// until robotd stops the robot anyway — it would protect nothing. The client counts as gone
+    /// no sooner than it is stopped. Only checked when netpad is on: robotd loads this file too,
+    /// and a board that does not use netpad must never fail to load over it.
+    #[test]
+    fn netpad_stale_must_be_below_the_deadman_and_the_timeout_not_below_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "[netpad]\nenabled = true\nstale_ms = 500\n");
+        let error = Params::load(&path, true).expect_err("refused").to_string();
+        assert!(error.contains("netpad.stale_ms"), "{error}");
+        assert!(error.contains("safety.deadman_ms"), "{error}");
+
+        let path = write(dir.path(), "[netpad]\nenabled = true\nstale_ms = 0\n");
+        assert!(Params::load(&path, true).is_err(), "zero is always stale");
+
+        let path = write(
+            dir.path(),
+            "[netpad]\nenabled = true\nstale_ms = 300\ntimeout_ms = 200\n",
+        );
+        let error = Params::load(&path, true).expect_err("refused").to_string();
+        assert!(error.contains("netpad.timeout_ms"), "{error}");
+
+        let path = write(
+            dir.path(),
+            "[netpad]\nenabled = true\nstale_ms = 500\ntimeout_ms = 5000\n[safety]\ndeadman_ms = 800\n",
+        );
+        let n = Params::load(&path, true).expect("valid").netpad;
+        assert_eq!((n.stale_ms, n.timeout_ms), (500, 5000));
+
+        let path = write(dir.path(), "[netpad]\nenabled = false\nstale_ms = 500\n");
+        assert_eq!(
+            Params::load(&path, true)
+                .expect("off is not checked")
+                .netpad
+                .stale_ms,
+            500
+        );
+    }
+
+    #[test]
+    fn netpad_defaults_are_off_on_4210_at_30_hz() {
+        let n = NetpadParams::default();
+        assert_eq!(
+            (n.enabled, n.port, n.max_hz, n.stale_ms, n.timeout_ms),
+            (false, 4210, 30, 300, 1000)
+        );
+    }
+
+    /// On by default, from the release's own copy of the model — a robot nobody configured stops
+    /// thrashing in the hand. `"none"` is the way to keep the switch on and load nothing.
+    #[test]
+    fn pickup_detection_ships_on_and_resolves_the_releases_model() {
+        let pickup = Params::default().pickup;
+        assert!(pickup.enabled);
+        assert_eq!(
+            pickup.model_resolved(),
+            Some(PathBuf::from(RELEASE_DIR).join("models/pickup_detector.onnx"))
+        );
+        let none = PickupParams {
+            model: Some(PathBuf::from("none")),
+            ..pickup
+        };
+        assert_eq!(none.model_resolved(), None);
+    }
+
+    /// The two thresholds are a hysteresis band. Inverted, the latch would pause and resume on
+    /// the same probability — refused, so `robotctl configure` cannot write it.
+    /// `[idle]` values the look-around would divide by, or that put a range backwards, are
+    /// refused by name; an ordinary retune loads.
+    #[test]
+    fn a_broken_idle_tuning_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for (text, key) in [
+            ("[idle]\nfade_s = 0.0\n", "idle.fade_s"),
+            ("[idle]\nhold_min_s = 4.0\n", "idle.hold_min_s"),
+            ("[idle]\ntilt_chance = 2.0\n", "idle.tilt_chance"),
+            ("[idle]\nnudge_yaw = -0.1\n", "idle.nudge_yaw"),
+        ] {
+            let path = write(dir.path(), text);
+            let error = Params::load(&path, true).unwrap_err().to_string();
+            assert!(error.contains(key), "{error}");
+        }
+        let path = write(dir.path(), "[idle]\nhold_max_s = 1.5\nnudge_yaw = 0.0\n");
+        let idle = Params::load(&path, true).unwrap().idle;
+        assert_eq!((idle.hold_max_s, idle.nudge_yaw), (1.5, 0.0));
+    }
+
+    /// Impact guard settings the firmware cannot take are refused by name, so `robotctl configure`
+    /// cannot write them; a retuned guard loads.
+    #[test]
+    fn an_impact_guard_the_firmware_cannot_take_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for (text, key) in [
+            (
+                "[bus]\nimpact_guard_v_fast = 0\n",
+                "bus.impact_guard_v_fast",
+            ),
+            (
+                "[bus]\nimpact_guard_pwm_fast = 0\n",
+                "bus.impact_guard_pwm_fast",
+            ),
+            (
+                "[bus]\nimpact_guard_pwm_fast = 120\n",
+                "bus.impact_guard_pwm_fast",
+            ),
+        ] {
+            let path = write(dir.path(), text);
+            let error = Params::load(&path, true).unwrap_err().to_string();
+            assert!(error.contains(key), "{error}");
+        }
+        let path = write(
+            dir.path(),
+            "[bus]\nimpact_guard_decel = 1000\nimpact_guard_i_hold_ma = 800\n",
+        );
+        let bus = Params::load(&path, true).unwrap().bus;
+        assert_eq!(
+            (bus.impact_guard_decel, bus.impact_guard_i_hold_ma),
+            (1000, 800)
+        );
+    }
+
+    /// The look-around is on for walking and off for the roller unless the file says otherwise.
+    /// Its head command is an observation input, and `roller.onnx` folds under one it was not
+    /// trained with — seen on the robot as a collapse about three seconds after the stick was
+    /// let go. A file that already says `enabled = true` keeps saying it, in either mode.
+    #[test]
+    fn the_idle_look_around_resolves_per_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let unset = Params::load(&write(dir.path(), ""), true).unwrap().idle;
+        assert!(unset.enabled_in(Mode::Walk), "walking looks around");
+        assert!(!unset.enabled_in(Mode::Roller), "the roller does not");
+
+        let on = Params::load(&write(dir.path(), "[idle]\nenabled = true\n"), true)
+            .unwrap()
+            .idle;
+        assert!(on.enabled_in(Mode::Roller), "an explicit on wins");
+        let off = Params::load(&write(dir.path(), "[idle]\nenabled = false\n"), true)
+            .unwrap()
+            .idle;
+        assert!(!off.enabled_in(Mode::Walk), "an explicit off wins");
+    }
+
+    /// The twist acceleration limit is the roller's: walking runs exactly as before, with no
+    /// limit on any axis. The roller ramps forward/back, and leaves strafe and yaw to the EMA —
+    /// a global `cmd_alpha` low enough to keep it up through a full reversal made it hard to turn.
+    #[test]
+    fn the_twist_acceleration_limit_resolves_per_mode() {
+        let walk = super::PolicyParams::default().resolved_with(None);
+        assert_eq!(walk.twist_accel, [None; 3], "walking is not limited");
+
+        let roller = super::PolicyParams {
+            mode: Mode::Roller,
+            ..Default::default()
+        }
+        .resolved_with(None);
+        assert_eq!(roller.twist_accel, [Some(1.0), None, None]);
+
+        let tuned = super::PolicyParams {
+            mode: Mode::Roller,
+            accel_vx: Some(0.0),
+            accel_vyaw: Some(4.0),
+            ..Default::default()
+        }
+        .resolved_with(None);
+        assert_eq!(
+            tuned.twist_accel,
+            [None, None, Some(4.0)],
+            "an explicit value wins, and 0 is off"
+        );
+
+        let walk_tuned = super::PolicyParams {
+            accel_vx: Some(2.0),
+            ..Default::default()
+        }
+        .resolved_with(None);
+        assert_eq!(walk_tuned.twist_accel[0], Some(2.0), "walking can opt in");
+    }
+
+    #[test]
+    fn a_negative_twist_acceleration_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for (text, key) in [
+            ("[policy]\naccel_vx = -1.0\n", "policy.accel_vx"),
+            ("[policy]\naccel_vyaw = nan\n", "policy.accel_vyaw"),
+        ] {
+            let path = write(dir.path(), text);
+            let error = Params::load(&path, true).unwrap_err().to_string();
+            assert!(error.contains(key), "{error}");
+        }
+        let path = write(dir.path(), "[policy]\naccel_vy = 0.5\n");
+        assert_eq!(
+            Params::load(&path, true).unwrap().policy.accel_vy,
+            Some(0.5)
+        );
+    }
+
+    #[test]
+    fn an_inverted_pickup_band_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "[pickup]\npause_threshold = 0.3\nresume_threshold = 0.5\n",
+        );
+        let error = Params::load(&path, true).expect_err("refused").to_string();
+        assert!(error.contains("pickup.resume_threshold"), "{error}");
+        let path = write(dir.path(), "[pickup]\npause_threshold = 1.0\n");
+        assert!(Params::load(&path, true).is_err());
+        let path = write(
+            dir.path(),
+            "[pickup]\nenabled = true\nresume_threshold = 0.5\n",
+        );
+        assert!(Params::load(&path, true).unwrap().pickup.enabled);
+    }
+
+    /// Each side of centre scales onto its own bound.
+    #[test]
+    fn pad_drive_scales_each_direction_onto_its_own_bound() {
+        let scale = PadDriveParams::scale;
+        assert_eq!(scale(1.0, -0.2, 0.4), 0.4);
+        assert_eq!(scale(-1.0, -0.2, 0.4), -0.2);
+        assert_eq!(scale(0.5, -0.2, 0.4), 0.2);
+        assert_eq!(scale(-0.5, -0.2, 0.4), -0.1);
+        assert_eq!(scale(0.0, -0.2, 0.4), 0.0);
+        assert_eq!(scale(-1.0, 0.0, 0.4), 0.0);
+    }
+
     /// A bitrate in the wrong unit is the mistake this band exists to catch: `2000` is somebody
     /// who meant kilobits, and it would produce a stream with no picture in it.
     #[test]
@@ -1435,7 +5177,11 @@ mod tests {
     #[test]
     fn the_defaults_are_what_mediad_streamed_before_the_section_existed() {
         let media = Params::default().media;
-        assert!(media.camera, "mediad.service carried --camera");
+        assert_eq!(
+            media.source,
+            MediaSource::Camera,
+            "mediad.service carried --camera"
+        );
         assert_eq!(media.quality.size(), (1280, 720));
         assert_eq!(media.quality.fps(), 30);
         assert_eq!(media.bitrate_resolved(), 2_000_000);
@@ -1474,8 +5220,7 @@ mod tests {
     #[test]
     fn the_openmd_install_config_parses() {
         let shipped = include_str!("../../deploy/robotd_openmd.toml");
-        let params: Params =
-            toml::from_str(shipped).expect("deploy/robotd_openmd.toml must parse");
+        let params: Params = toml::from_str(shipped).expect("deploy/robotd_openmd.toml must parse");
         let policy = params.resolved_policy();
         assert_eq!(policy.gain, 6);
         assert_eq!(policy.standing_gain_ratio, 1.0);
@@ -1498,11 +5243,30 @@ mod tests {
 
         assert_eq!(from_file.platform.variant, built_in.platform.variant);
         assert_eq!(from_file.bus.port, built_in.bus.port);
+        assert_eq!(from_file.bus.fast_sync_read, built_in.bus.fast_sync_read);
+        assert_eq!(from_file.bus.impact_guard, built_in.bus.impact_guard);
+        let guard = |b: &Bus| {
+            (
+                b.impact_guard_v_min,
+                b.impact_guard_brake_ms,
+                b.impact_guard_decel,
+                b.impact_guard_i_hold_ma,
+                b.impact_guard_v_fast,
+                b.impact_guard_pwm_fast,
+            )
+        };
+        assert_eq!(guard(&from_file.bus), guard(&built_in.bus));
         assert_eq!(from_file.control.hz, built_in.control.hz);
         assert_eq!(from_file.control.cmd_alpha, built_in.control.cmd_alpha);
         assert_eq!(from_file.control.head_alpha, built_in.control.head_alpha);
+        assert_eq!(
+            from_file.control.publish_velocity_and_load,
+            built_in.control.publish_velocity_and_load
+        );
         assert_eq!(from_file.policy.resolved(), built_in.policy.resolved());
         assert_eq!(from_file.safety.limp_fall, built_in.safety.limp_fall);
+        assert_eq!(from_file.pickup, built_in.pickup);
+        assert_eq!(from_file.idle, built_in.idle);
         assert_eq!(
             from_file.safety.battery_empty_shutdown,
             built_in.safety.battery_empty_shutdown
@@ -1511,6 +5275,7 @@ mod tests {
             from_file.update_gate.min_achieved_hz,
             built_in.update_gate.min_achieved_hz
         );
+        assert_eq!(from_file.pad_drive, built_in.pad_drive);
         assert_eq!(
             from_file.update_gate.stall_periods,
             built_in.update_gate.stall_periods
@@ -1519,7 +5284,7 @@ mod tests {
             from_file.update_gate.max_consecutive_errors,
             built_in.update_gate.max_consecutive_errors
         );
-        assert_eq!(from_file.media.camera, built_in.media.camera);
+        assert_eq!(from_file.media.source, built_in.media.source);
         assert_eq!(from_file.media.quality, built_in.media.quality);
         assert_eq!(
             from_file.media.bitrate_resolved(),
@@ -1556,20 +5321,39 @@ mod tests {
         assert_eq!(p.ground_pick_period, 4.0);
         assert_eq!(p.ground_pick_action_scale, 1.0);
         assert_eq!(p.ground_pick_gain_ratio, 1.0);
-        assert_eq!(p.kick_duration, 0.5);
-        assert_eq!(p.roulade_duration, 1.0, "one roll, the measured time");
-        assert_eq!(p.roulade_action_scale, 1.0);
-        assert_eq!(p.roulade_gain_ratio, 1.0);
-        assert!(!p.voltage_adapt, "off by default in the prototype");
-        assert_eq!(p.nominal_voltage, 7.4, "2S pack");
+        // The three one-shots and their numbers, which used to be four flat keys here.
+        let skill = |name: &str| {
+            p.skills
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("no {name} skill"))
+        };
+        assert_eq!(skill("kick_left").duration, 0.5);
+        assert_eq!(skill("kick_right").duration, 0.5);
+        assert_eq!(
+            skill("roulade").duration,
+            1.0,
+            "one roll, the measured time"
+        );
+        assert!(skill("roulade").chain, "holding the button chains rolls");
+        assert!(!skill("kick_left").chain);
+        assert!(!p.voltage_adapt, "off by default for the fork");
+        assert_eq!(p.nominal_voltage, 7.4);
+        assert!(
+            !PolicyParams::default().allow_community,
+            "only pollen-robotics policies out of the box"
+        );
 
         let name = |p: &Option<std::path::PathBuf>| {
             p.as_ref()
                 .and_then(|p| p.file_name())
                 .map(|n| n.to_string_lossy().into_owned())
         };
-        assert!(p.walk.ends_with("policies/alpha_walking.onnx"));
-        assert_eq!(name(&p.stand).as_deref(), Some("alpha_stand.onnx"));
+        assert_eq!(p.walk, PathBuf::from(POLICY_DIR).join("velstand.onnx"));
+        assert!(
+            p.stand.is_none(),
+            "velstand stands on its own; no standing network by default"
+        );
         assert_eq!(name(&p.sitstand).as_deref(), Some("alpha_sitstand.onnx"));
         assert_eq!(
             name(&p.ground_pick).as_deref(),
@@ -1601,7 +5385,7 @@ mod tests {
         let p = Params::load(&path, true).unwrap().policy.resolved();
 
         assert_eq!(p.mode, Mode::Roller);
-        assert!(p.walk.ends_with("policies/roller.onnx"));
+        assert_eq!(p.walk, PathBuf::from(POLICY_DIR).join("roller.onnx"));
         assert_eq!(
             p.stand, None,
             "the prototype never runs standing in roller mode"
@@ -1652,7 +5436,10 @@ mod tests {
         assert!(p.platform.variant.imu_on_bus());
         let r = p.resolved_policy();
         assert_eq!(r.gain, 200);
-        assert_eq!(r.standing_gain_ratio, 0.8, "XL330 prototype --standing-kp-ratio");
+        assert_eq!(
+            r.standing_gain_ratio, 0.8,
+            "XL330 prototype --standing-kp-ratio"
+        );
         assert_eq!(r.nominal_voltage, 7.4);
         assert_eq!(p.gain_limp(), 50);
         assert_eq!(p.limp_fall_pose_gain(), 160);
@@ -1802,5 +5589,57 @@ mod tests {
             let path = write(dir.path(), &format!("[control]\nhz = {hz}\n"));
             assert!(Params::load(&path, true).is_err(), "hz = {hz} was accepted");
         }
+    }
+
+    /// `updaterd` asks this before every fetch, so it must answer from a file `robotd` would
+    /// reject, and must fall to "no" — the answer that downloads nothing — on anything else.
+    #[test]
+    fn community_allowed_reads_one_key_and_defaults_to_no() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("robotd.toml");
+
+        let read = |text: &str| {
+            std::fs::write(&path, text).expect("write");
+            PolicyParams::community_allowed(&path)
+        };
+        assert!(read("[policy]\nallow_community = true\n"));
+        assert!(
+            read("[policy]\nallow_community = true\n[future]\nx = 2\n"),
+            "a section this build does not know is no reason to change the answer"
+        );
+        assert!(!read("[policy]\nallow_community = false\n"));
+        assert!(!read("[policy]\n# allow_community = true\n"));
+        assert!(!read("[policy]\nallow_community = \"yes\"\n"));
+        assert!(!read("not toml ["));
+        std::fs::remove_file(&path).expect("remove");
+        assert!(!PolicyParams::community_allowed(&path));
+    }
+
+    /// `updaterd` asks this before every revert, so it must answer from a file `robotd` would
+    /// reject, let the user layer win, and fall to "no" — leave the release alone — otherwise.
+    #[test]
+    fn auto_rollback_reads_one_key_layered_and_defaults_to_off() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("robotd.toml");
+
+        let read = |text: &str| {
+            std::fs::write(&path, text).expect("write");
+            UpdateGate::auto_rollback_enabled(&path)
+        };
+        assert!(read("[update_gate]\nauto_rollback = true\n"));
+        assert!(
+            read("[update_gate]\nauto_rollback = true\n[future]\nx = 2\n"),
+            "a section this build does not know is no reason to change the answer"
+        );
+        assert!(!read("[update_gate]\nauto_rollback = false\n"));
+        assert!(!read("[update_gate]\n# auto_rollback = true\n"));
+        assert!(!read("[update_gate]\nauto_rollback = \"yes\"\n"));
+        assert!(!read("not toml ["));
+        std::fs::remove_file(&path).expect("remove");
+        assert!(!UpdateGate::auto_rollback_enabled(&path));
+        assert!(
+            !Params::default().update_gate.auto_rollback,
+            "off unless asked for"
+        );
     }
 }

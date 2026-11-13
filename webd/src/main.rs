@@ -316,6 +316,7 @@ async fn follow_logs(
     follow_capture(socket, capture, unit, stream).await;
 }
 
+#[cfg(not(unix))]
 async fn follow_capture(
     socket: WebSocket,
     capture: logs::Capture,

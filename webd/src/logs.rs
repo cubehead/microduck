@@ -204,7 +204,17 @@ pub async fn daemon_status() -> Vec<Value> {
 #[cfg(unix)]
 async fn unit_status(id: &str) -> Value {
     let shown = tokio::process::Command::new("systemctl")
-        .args(["show", "-p", "ActiveState", "-p", "SubState", "-p", "MainPID", "--", id])
+        .args([
+            "show",
+            "-p",
+            "ActiveState",
+            "-p",
+            "SubState",
+            "-p",
+            "MainPID",
+            "--",
+            id,
+        ])
         .output()
         .await;
     let mut active = "unknown".to_owned();
@@ -317,7 +327,10 @@ async fn journalctl(unit: &str, stream: &str, n: usize) -> Result<JournalOut, St
     snapshot_args(&mut cmd, unit);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
-    let done = cmd.output().await.map_err(|e| format!("无法运行 journalctl：{e}"))?;
+    let done = cmd
+        .output()
+        .await
+        .map_err(|e| format!("无法运行 journalctl：{e}"))?;
     let stderr = String::from_utf8_lossy(&done.stderr).trim().to_owned();
     let stdout = String::from_utf8_lossy(&done.stdout);
     if !done.status.success() && stdout.is_empty() {

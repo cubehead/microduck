@@ -18,7 +18,7 @@
 //! trigger an update or a rollback, so it is created `0o660`, group-owned, and every
 //! mutating request is logged with the caller's uid/pid from `SO_PEERCRED`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -120,6 +120,20 @@ pub struct Server {
 
     /// Test-only override of the owning uid; `None` means "read it from the socket".
     forced_owner_uid: Option<u32>,
+
+    /// Which Hugging Face account this robot belongs to.
+    ///
+    /// Not part of the engine: it shares nothing with an update but the network stack, and it
+    /// must stay answerable *during* one — `account.status` is polled while a login is in
+    /// flight, and queueing that behind a download would make a wizard look stuck.
+    account: Arc<crate::account::Account>,
+
+    /// Where `vetbook.share` asks for the book and the robot's name.
+    vetbook: crate::vetbook::Sources,
+
+    /// Anonymous usage data: the owner's switch, and the queue the task started by
+    /// [`Self::spawn_telemetry`] sends.
+    telemetry: Arc<crate::telemetry::Telemetry>,
 }
 
 impl Server {
@@ -129,6 +143,24 @@ impl Server {
 
     /// As [`Self::new`], with uids/gids permitted to mutate beyond the owning uid.
     pub fn with_policy(engine: Engine, allow_uids: Vec<u32>, allow_gids: Vec<u32>) -> Self {
+        Self::with_policy_at(
+            engine,
+            allow_uids,
+            allow_gids,
+            PathBuf::from(crate::account::DEFAULT_PATH),
+        )
+    }
+
+    /// [`Self::with_policy`], with the account credential somewhere other than a robot's.
+    ///
+    /// The simulator, where the daemons run as a person and `/etc/robot` is not writable. See
+    /// [`crate::account::account_at`].
+    pub fn with_policy_at(
+        engine: Engine,
+        allow_uids: Vec<u32>,
+        allow_gids: Vec<u32>,
+        token_path: PathBuf,
+    ) -> Self {
         let (progress_tx, _) = broadcast::channel(PROGRESS_BUFFER);
         Self {
             engine: Arc::new(Mutex::new(engine)),
@@ -139,7 +171,36 @@ impl Server {
             allow_uids,
             allow_gids,
             forced_owner_uid: None,
+            account: Arc::new(crate::account::account_at(token_path)),
+            vetbook: crate::vetbook::Sources::default(),
+            telemetry: Arc::new(crate::telemetry::Telemetry::new(PathBuf::from(
+                crate::telemetry::DEFAULT_PATH,
+            ))),
         }
+    }
+
+    /// Keep the telemetry state somewhere other than a robot's: `updaterd` passes its
+    /// `state_dir`, and a test a temporary directory.
+    pub fn with_telemetry_at(mut self, path: PathBuf) -> Self {
+        self.telemetry = Arc::new(crate::telemetry::Telemetry::new(path));
+        self
+    }
+
+    /// Where `vetbook.share` finds `robotd` and `configd`, when not at their default sockets.
+    pub fn with_vetbook_sources(mut self, sources: crate::vetbook::Sources) -> Self {
+        self.vetbook = sources;
+        self
+    }
+
+    /// Point the account at a token file and a Hugging Face of your choosing.
+    ///
+    /// Only for tests, and it is not optional there: [`Self::with_policy`] uses
+    /// [`crate::account::DEFAULT_PATH`], and a test that ran against it would read — or on a
+    /// developer's machine try to write — the real robot's credential.
+    #[doc(hidden)]
+    pub fn with_account_for_test(mut self, token_path: PathBuf, endpoint: String) -> Self {
+        self.account = Arc::new(crate::account::account_for_test(token_path, endpoint));
+        self
     }
 
     /// Build a server with an explicit owning uid.
@@ -255,6 +316,21 @@ impl Server {
                 tokio::time::sleep(interval).await;
             }
         })
+    }
+
+    /// Keep the account token from expiring under a robot that is simply left on.
+    ///
+    /// Separate from [`Self::spawn_periodic_checks`] because it is unconditional: that one is
+    /// off unless a `check_interval` is configured, and a robot with update checks disabled
+    /// still has an account that stops working after thirty days.
+    pub fn spawn_account_maintenance(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(crate::account::maintain(Arc::clone(&self.account)))
+    }
+
+    /// Report this start and send usage data until the process ends. Nothing leaves the robot
+    /// while the owner's switch is off; see [`crate::telemetry`].
+    pub fn spawn_telemetry(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(Arc::clone(&self.telemetry).run(self.vetbook.robot_socket.clone()))
     }
 
     /// One pass of the scheduler. Exposed so tests can drive it without waiting for
@@ -573,6 +649,174 @@ impl Server {
                 })
                 .await
             }
+            // No engine lock: it reads a directory and makes one HTTP request, touches no engine
+            // state, and a question about whether a newer gait exists should stay answerable
+            // while an unrelated update runs.
+            Call::PolicyCheck => {
+                Response::ok(Some(id), &crate::policy::check(
+                    std::path::Path::new(crate::policy::POLICY_ROOT),
+                ).await)
+            }
+            // `try_lock` and the same `BUSY` every other mutation answers with. Swapping the
+            // policy set while a release is being installed would have two things rewriting what
+            // the robot runs at once, and the second one to finish would win by accident.
+            Call::PolicyInstall(params) => {
+                let engine = match self.engine.try_lock() {
+                    Ok(engine) => engine,
+                    Err(_) => {
+                        return Response::err(
+                            Some(id),
+                            proto::Error::new(
+                                proto::code::BUSY,
+                                "an update is in progress; retry shortly",
+                            ),
+                        );
+                    }
+                };
+                match engine.install_policies(params.version.as_deref()).await {
+                    Ok(result) => Response::ok(Some(id), &result),
+                    Err(e) => Response::err(Some(id), e.to_rpc_error()),
+                }
+            }
+            // The detector's set: the same two questions against the other root, and the same
+            // locking — a read that takes no lock, an install that must not run beside a release
+            // install because both would be restarting daemons at once.
+            Call::DetectorCheck => {
+                Response::ok(Some(id), &crate::policy::check(
+                    std::path::Path::new(crate::policy::DETECTOR_ROOT),
+                ).await)
+            }
+            Call::DetectorInstall(params) => {
+                let engine = match self.engine.try_lock() {
+                    Ok(engine) => engine,
+                    Err(_) => {
+                        return Response::err(
+                            Some(id),
+                            proto::Error::new(
+                                proto::code::BUSY,
+                                "an update is in progress; retry shortly",
+                            ),
+                        );
+                    }
+                };
+                match engine.install_detector(params.version.as_deref()).await {
+                    Ok(result) => Response::ok(Some(id), &result),
+                    Err(e) => Response::err(Some(id), e.to_rpc_error()),
+                }
+            }
+            // ── account.* ───────────────────────────────────────────────────────
+            //
+            // None of the three touches the engine, so none takes its lock: a login is an HTTP
+            // round trip and a file, and both are outside every release directory. That is also
+            // what makes `status` answerable during an update, which it has to be.
+            Call::AccountLogin(params) => {
+                match Arc::clone(&self.account).login(params.force).await {
+                    Ok(code) => Response::ok(Some(id), &crate::account::login_result(code)),
+                    Err(e) => Response::err(Some(id), crate::Error::from(e).to_rpc_error()),
+                }
+            }
+            Call::AccountStatus => Response::ok(
+                Some(id),
+                &crate::account::status_result(self.account.status().await),
+            ),
+            Call::AccountLogout => match self.account.logout().await {
+                Ok(was) => Response::ok(Some(id), &crate::account::logout_result(was)),
+                Err(e) => Response::err(Some(id), crate::Error::from(e).to_rpc_error()),
+            },
+            // ── telemetry.* ─────────────────────────────────────────────────────
+            //
+            // No engine lock: a flag and a small file, outside every release directory.
+            Call::TelemetryStatus => Response::ok(Some(id), &self.telemetry.status()),
+            Call::TelemetrySet(params) => match self.telemetry.set(params.enabled) {
+                Ok(result) => Response::ok(Some(id), &result),
+                Err(e) => Response::err(Some(id), e.to_rpc_error()),
+            },
+            // No engine lock, like the account: it reads two daemons and talks to the Hub, and
+            // touches nothing an update owns.
+            Call::VetbookShare(params) => {
+                match crate::vetbook::share(&self.account, &self.vetbook, &params).await {
+                    Ok(result) => Response::ok(Some(id), &result),
+                    Err(e) => Response::err(Some(id), e.to_rpc_error()),
+                }
+            }
+
+            // ── os.* ────────────────────────────────────────────────────────────
+            //
+            // The reads take no engine lock: the OS's state is the script's, not the engine's, and
+            // `os.status` is what a client polls while an OS update downloads.
+            Call::OsStatus => match crate::os::status(&crate::os::Tools::system()).await {
+                Ok(status) => Response::ok(Some(id), &status),
+                Err(e) => Response::err(Some(id), e),
+            },
+            Call::OsCheck => match crate::os::check(&crate::os::Tools::system()).await {
+                Ok(status) => Response::ok(Some(id), &status),
+                Err(e) => Response::err(Some(id), e),
+            },
+            // `try_lock` and `BUSY`, like every other mutation: an OS update started under a
+            // daemon release being installed would reboot the board in the middle of its swap.
+            // Held until the answer, so neither can start while the other is getting going.
+            Call::OsApply(_) | Call::OsSwitch(_) => {
+                let (action, interrupt_sessions) = match call {
+                    Call::OsApply(p) => (crate::os::Action::Apply(p.build), p.interrupt_sessions),
+                    Call::OsSwitch(p) => (crate::os::Action::Switch, p.interrupt_sessions),
+                    _ => unreachable!("matched above"),
+                };
+                let engine = match self.engine.try_lock() {
+                    Ok(engine) => engine,
+                    Err(_) => {
+                        return Response::err(
+                            Some(id),
+                            proto::Error::new(
+                                proto::code::BUSY,
+                                "an update is in progress; retry shortly",
+                            ),
+                        );
+                    }
+                };
+                let network = matches!(action, crate::os::Action::Apply(_));
+                if let Err(e) = engine.os_preflight(interrupt_sessions, network).await {
+                    return Response::err(Some(id), e.to_rpc_error());
+                }
+                match crate::os::start(&crate::os::Tools::system(), &action).await {
+                    Ok(status) => Response::ok(Some(id), &status),
+                    Err(e) => Response::err(Some(id), e),
+                }
+            }
+
+            // Read-only and no engine lock: asking the Hub what exists changes nothing here.
+            Call::PolicySearch(params) => match crate::policy::search(&params.query).await {
+                Ok(result) => Response::ok(Some(id), &result),
+                Err(e) => Response::err(Some(id), e.to_rpc_error()),
+            },
+            // `try_lock` like the other mutations. Nothing it writes collides with an update —
+            // the library is outside every release directory — but it asks `robotd` for the
+            // model API, and doing that mid-swap gets an answer about whichever daemon happens
+            // to be running at that instant.
+            Call::PolicyFetch(params) => {
+                let engine = match self.engine.try_lock() {
+                    Ok(engine) => engine,
+                    Err(_) => {
+                        return Response::err(
+                            Some(id),
+                            proto::Error::new(
+                                proto::code::BUSY,
+                                "an update is in progress; retry shortly",
+                            ),
+                        );
+                    }
+                };
+                match engine
+                    .fetch_policy(
+                        &params.repo,
+                        params.revision.as_deref(),
+                        params.file.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(result) => Response::ok(Some(id), &result),
+                    Err(e) => Response::err(Some(id), e.to_rpc_error()),
+                }
+            }
             Call::Rollback(params) => {
                 let component = params.component.0;
                 self.run_mutating(id, out, move |engine, _tx| {
@@ -624,7 +868,6 @@ impl Server {
             Call::RobotSafeToRestart
             | Call::RobotHealth
             | Call::RobotModelApi
-            | Call::RobotRemoteSessionActive
             | Call::RobotMove(_)
             | Call::RobotHead(_)
             | Call::RobotLook(_)
@@ -632,11 +875,15 @@ impl Server {
             | Call::RobotEnable(_)
             | Call::RobotInit
             | Call::RobotRelax
+            | Call::RobotRebootMotors(_)
+            | Call::RobotRest
             | Call::RobotDo(_)
             | Call::RobotSound(_)
+            | Call::RobotFlashlight(_)
             | Call::RobotPose(_)
             | Call::RobotMouth(_)
             | Call::RobotTheremin(_)
+            | Call::RobotLaserTrack(_)
             | Call::RobotChorale(_)
             | Call::ChoraleSubscribe
             | Call::ChoraleBeaconSet(_)
@@ -644,6 +891,13 @@ impl Server {
             | Call::RobotShutdown
             | Call::RobotMode
             | Call::RobotSetMode(_)
+            | Call::RobotPolicies
+            | Call::RobotModel
+            | Call::RobotVetbook
+            | Call::RobotVetbookNote(_)
+            | Call::RobotVetbookTally(_)
+            | Call::RobotLoadPolicy(_)
+            | Call::RobotReloadPolicies
             | Call::RobotSubscribe(_) => Response::err(
                 Some(id),
                 proto::Error::new(
@@ -661,6 +915,7 @@ impl Server {
             | Call::NetForget(_)
             | Call::SystemInfo
             | Call::SystemServices
+            | Call::SystemLogs(_)
             | Call::SystemSetName(_)
             | Call::SystemReboot
             | Call::SystemPairingPin
@@ -670,11 +925,19 @@ impl Server {
             // working.
             | Call::PadStatus
             | Call::PadPair(_)
-            | Call::PadForget(_) => Response::err(
+            | Call::PadForget(_)
+            // The two exceptions in that namespace go to `robotd` rather than `configd` — a
+            // binding needs the skill list to check a name against — but from here the answer is
+            // the same either way: not this daemon.
+            | Call::PadBindings
+            | Call::PadBind(_)
+            | Call::RobotSkills
+            | Call::RobotSetSkill(_)
+            | Call::RobotRemoveSkill(_) => Response::err(
                 Some(id),
                 proto::Error::new(
                     proto::code::METHOD_NOT_FOUND,
-                    "net.*, system.* and pad.* are served by configd, not updaterd",
+                    "net.*, system.* and pad.* are served by configd and robotd, not updaterd",
                 ),
             ),
 
@@ -691,11 +954,19 @@ impl Server {
             ),
 
             // Same story one namespace over: `tofd` owns the sensor and answers for it.
-            Call::TofStream => Response::err(
+            Call::TofStream | Call::HeadImuStream => Response::err(
                 Some(id),
                 proto::Error::new(
                     proto::code::METHOD_NOT_FOUND,
-                    "tof.stream is served by tofd itself, on /run/tofd/tof.sock",
+                    "tof.stream is served by tofd, on /run/tofd/tof.sock; head_imu.stream by tofd on a zero3 and by robotd (/run/robotd.sock) on a beta",
+                ),
+            ),
+
+            Call::NfcWrite(_) => Response::err(
+                Some(id),
+                proto::Error::new(
+                    proto::code::METHOD_NOT_FOUND,
+                    "nfc.write is served by nfcd, on /run/nfcd/nfc.sock",
                 ),
             ),
 

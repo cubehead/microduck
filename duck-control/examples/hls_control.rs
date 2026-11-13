@@ -57,23 +57,23 @@ const fn tune(limit_deg: f64, torque: u16) -> Tune {
 /// (id 12 kept the old 100 because that slot was `head_yaw`).
 const fn tune_for(id: u8) -> Tune {
     match id {
-        10 => tune(25.0, 100),  // right_hip_yaw
-        11 => tune(24.0, 200),  // right_hip_roll
-        12 => tune(30.0, 200),  // right_hip_pitch
-        13 => tune(30.0, 100),  // right_knee
-        14 => tune(30.0, 100),  // right_ankle
-        20 => tune(25.0, 100),  // left_hip_yaw
-        21 => tune(24.0, 200),  // left_hip_roll
-        22 => tune(30.0, 200),  // left_hip_pitch
-        23 => tune(30.0, 100),  // left_knee
-        24 => tune(30.0, 100),  // left_ankle
+        10 => tune(25.0, 100), // right_hip_yaw
+        11 => tune(24.0, 200), // right_hip_roll
+        12 => tune(30.0, 200), // right_hip_pitch
+        13 => tune(30.0, 100), // right_knee
+        14 => tune(30.0, 100), // right_ankle
+        20 => tune(25.0, 100), // left_hip_yaw
+        21 => tune(24.0, 200), // left_hip_roll
+        22 => tune(30.0, 200), // left_hip_pitch
+        23 => tune(30.0, 100), // left_knee
+        24 => tune(30.0, 100), // left_ankle
         // Neck carries the head. 1000 (100%) in mode 2 has no speed cap: one
         // poll slammed past ±30° and the pull-in chatter shook the joint.
         30 => tune(30.0, 300), // neck_pitch
         31 => tune(30.0, 100), // head_pitch
-        32 => tune(30.0, 100),  // head_yaw
-        33 => tune(20.0, 100),  // head_roll
-        34 => tune(12.0, 80),   // mouth
+        32 => tune(30.0, 100), // head_yaw
+        33 => tune(20.0, 100), // head_roll
+        34 => tune(12.0, 80),  // mouth
         _ => tune(0.0, 0),
     }
 }

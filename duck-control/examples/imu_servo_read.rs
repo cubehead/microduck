@@ -113,7 +113,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .collect::<Vec<_>>()
             .join(", ")
     };
-    println!("{} {} 8N1  imu: {imu_list}  servos: {servo_list}", args.port, args.baud);
+    println!(
+        "{} {} 8N1  imu: {imu_list}  servos: {servo_list}",
+        args.port, args.baud
+    );
     println!(
         "imu unicast addr={SERVO_ADDR} len={IMU_LEN}   \
          servos sync_read addr={SERVO_ADDR} len={SERVO_LEN}  \

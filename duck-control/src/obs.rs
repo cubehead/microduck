@@ -53,6 +53,15 @@ pub const OBS_LEN: usize = 61;
 /// Actions a policy returns — the 15 joints minus the mouth.
 pub const ACTION_LEN: usize = 14;
 
+/// These two are also a published contract, in `duck_ipc_proto` — a policy manifest declares
+/// them, and `updaterd` refuses a mismatched policy on them before it downloads 800 KB. Two
+/// copies of a number that decides whether a robot walks is exactly the drift this repository
+/// keeps writing tests about, so here is the test.
+const _: () = {
+    assert!(OBS_LEN == duck_ipc_proto::POLICY_OBS_LEN);
+    assert!(ACTION_LEN == duck_ipc_proto::POLICY_ACTION_LEN);
+};
+
 /// Joints that appear in the observation: all but the mouth.
 pub const OBS_JOINTS: usize = NUM_JOINTS - 1;
 
@@ -97,7 +106,7 @@ pub struct BodyPose {
 /// Returns an array rather than an iterator so its width is part of its type. A filtered
 /// iterator is not `ExactSizeIterator` — `Filter` cannot know how many elements pass — and
 /// that is what would force [`fill`] to count at runtime instead of being checked here.
-fn policy_joints(values: &[f64; NUM_JOINTS]) -> [f64; OBS_JOINTS] {
+pub(crate) fn policy_joints(values: &[f64; NUM_JOINTS]) -> [f64; OBS_JOINTS] {
     // Skipping one valid index leaves exactly one fewer. Stated as a compile-time check so
     // the reasoning is enforced rather than merely believed.
     const { assert!(OBS_JOINTS == NUM_JOINTS - 1) };
@@ -133,6 +142,13 @@ fn fill<const N: usize>(block: &mut [f32; N], values: [f64; N]) {
 #[derive(Debug, Clone, Copy)]
 pub struct Observation {
     data: [f32; OBS_LEN],
+}
+
+/// Replay an already assembled observation (for offline policy rehearsal).
+impl From<[f32; OBS_LEN]> for Observation {
+    fn from(data: [f32; OBS_LEN]) -> Self {
+        Self { data }
+    }
 }
 
 impl Observation {
@@ -227,12 +243,28 @@ impl Observation {
         }
         out
     }
+
+    /// The inverse of [`Self::scatter_action`]: the 14 policy slots of a 15-joint vector, the
+    /// mouth left out. For seeding a policy's previous action from a pose it did not command.
+    pub fn gather_action(values: &[f64; NUM_JOINTS]) -> [f32; ACTION_LEN] {
+        const { assert!(ACTION_LEN == OBS_JOINTS) };
+        policy_joints(values).map(|v| v as f32)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::DEFAULT_POSITION;
+
+    /// Gathering undoes scattering, slot for slot, and the mouth is the one joint left out.
+    #[test]
+    fn gather_is_the_inverse_of_scatter() {
+        let action: [f32; ACTION_LEN] = std::array::from_fn(|i| i as f32 + 1.0);
+        let joints = Observation::scatter_action(&action);
+        assert_eq!(joints[crate::model::MOUTH_INDEX], 0.0);
+        assert_eq!(Observation::gather_action(&joints), action);
+    }
 
     fn imu() -> ImuData {
         ImuData {

@@ -86,7 +86,11 @@ pub fn datagram(name: &str, serial: Option<&str>, api: u32, ip4: Ipv4Addr) -> Ve
 /// Send until the task is dropped. A send failure is logged when it changes and retried next
 /// second; it does not stop `configd`, because the socket this process exists to serve is the
 /// unix one.
-pub async fn run(net: Arc<dyn Net>, name: impl Fn() -> String + Send + 'static, serial: Option<String>) {
+pub async fn run(
+    net: Arc<dyn Net>,
+    name: impl Fn() -> String + Send + 'static,
+    serial: Option<String>,
+) {
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut bound: Option<(Ipv4Addr, UdpSocket)> = None;
@@ -95,7 +99,9 @@ pub async fn run(net: Arc<dyn Net>, name: impl Fn() -> String + Send + 'static, 
     loop {
         ticker.tick().await;
         let announcement = match net.lan().await {
-            Ok(Some(lan)) => subnet_broadcast(lan.address, lan.prefix).map(|broadcast| (lan, broadcast)),
+            Ok(Some(lan)) => {
+                subnet_broadcast(lan.address, lan.prefix).map(|broadcast| (lan, broadcast))
+            }
             Ok(None) => None,
             Err(error) => {
                 note(&mut last_error, error);
@@ -109,7 +115,10 @@ pub async fn run(net: Arc<dyn Net>, name: impl Fn() -> String + Send + 'static, 
             continue;
         };
 
-        if bound.as_ref().is_none_or(|(address, _)| *address != lan.address) {
+        if bound
+            .as_ref()
+            .is_none_or(|(address, _)| *address != lan.address)
+        {
             match UdpSocket::bind((lan.address, 0)).await {
                 Ok(socket) => match socket.set_broadcast(true) {
                     Ok(()) => bound = Some((lan.address, socket)),
@@ -130,7 +139,12 @@ pub async fn run(net: Arc<dyn Net>, name: impl Fn() -> String + Send + 'static, 
         let Some((_, socket)) = bound.as_ref() else {
             continue;
         };
-        let packet = datagram(&name(), serial.as_deref(), duck_ipc_proto::API_VERSION, lan.address);
+        let packet = datagram(
+            &name(),
+            serial.as_deref(),
+            duck_ipc_proto::API_VERSION,
+            lan.address,
+        );
         let destination = SocketAddrV4::new(broadcast, PORT);
         match socket.send_to(&packet, destination).await {
             Ok(_) => last_error = None,
@@ -189,7 +203,12 @@ mod tests {
 
     #[test]
     fn the_datagram_is_the_magic_and_one_json_object() {
-        let bytes = datagram("duck-c51b", Some("bb7b734a7717ac41"), 17, Ipv4Addr::new(192, 168, 1, 42));
+        let bytes = datagram(
+            "duck-c51b",
+            Some("bb7b734a7717ac41"),
+            17,
+            Ipv4Addr::new(192, 168, 1, 42),
+        );
         assert!(bytes.len() < 256, "a discovery packet stays in one frame");
         let text = std::str::from_utf8(&bytes).unwrap();
         let (magic, rest) = text.split_once('\n').unwrap();
@@ -207,7 +226,8 @@ mod tests {
     fn a_board_with_no_serial_says_so_as_null() {
         let bytes = datagram("robot", None, 17, Ipv4Addr::new(192, 168, 1, 42));
         let text = std::str::from_utf8(&bytes).unwrap();
-        let body: serde_json::Value = serde_json::from_str(text.split_once('\n').unwrap().1.trim_end()).unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(text.split_once('\n').unwrap().1.trim_end()).unwrap();
         assert!(body["serial"].is_null());
     }
 }

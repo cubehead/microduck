@@ -31,6 +31,9 @@ pub struct HeadFk {
     /// true position, a couple of centimetres from the camera it would
     /// otherwise borrow.
     tof: Option<SiteId>,
+    /// The MJCF's `head_imu` site (the BMI088 on the HAT), when the asset carries one. Tilted
+    /// relative to the camera — the mount is not axis-aligned.
+    head_imu: Option<SiteId>,
     joints: [usize; 4],
 }
 
@@ -44,6 +47,7 @@ impl HeadFk {
                 .site("head_camera")
                 .expect("model has a head_camera site"),
             tof: model.site("tof"),
+            head_imu: model.site("head_imu"),
             joints: HEAD_JOINTS
                 .map(|name| model.joint_index(name).expect("model has the head joints")),
         }
@@ -82,6 +86,16 @@ impl HeadFk {
                 Pose::new(cam.pos, cam.quat * SENSOR_IN_CV2_Q)
             }
         }
+    }
+
+    /// Head-IMU (BMI088) pose in the trunk frame, when the asset has a `head_imu` site.
+    ///
+    /// The site frame is the sensor's own axes as mounted — tilted, not aligned with the camera.
+    /// Rotating a sensor-frame vector by the result's quat expresses it in the trunk, which is how
+    /// a consumer places `head_imu.stream` samples in the robot frame. `None` for an asset with no
+    /// such site (the caller then has no mount and must skip the transform).
+    pub fn head_imu_in_trunk(&self, joints: [f64; 4]) -> Option<Pose> {
+        self.head_imu.map(|site| self.site_in_trunk(site, joints))
     }
 
     /// A head-chain site posed by the four head joints, everything else at
@@ -166,19 +180,22 @@ impl HeadFk {
 
             // Solve (JᵀJ + λI) Δ = -Jᵀe, the 2×2 case written out.
             let (a, b) = (
-                j[0][0] * j[0][0] + j[1][0] * j[1][0] + LAMBDA,
-                j[0][0] * j[0][1] + j[1][0] * j[1][1],
+                j[1][0].mul_add(j[1][0], j[0][0] * j[0][0]) + LAMBDA,
+                j[1][0].mul_add(j[1][1], j[0][0] * j[0][1]),
             );
-            let d = j[0][1] * j[0][1] + j[1][1] * j[1][1] + LAMBDA;
+            let d = j[1][1].mul_add(j[1][1], j[0][1] * j[0][1]) + LAMBDA;
             let g = [
-                j[0][0] * e[0] + j[1][0] * e[1],
-                j[0][1] * e[0] + j[1][1] * e[1],
+                j[1][0].mul_add(e[1], j[0][0] * e[0]),
+                j[1][1].mul_add(e[1], j[0][1] * e[0]),
             ];
-            let det = a * d - b * b;
+            let det = b.mul_add(-b, a * d);
             if det.abs() < 1e-12 {
                 break; // fully singular and damped-out: nothing left to gain
             }
-            let step = [(-d * g[0] + b * g[1]) / det, (b * g[0] - a * g[1]) / det];
+            let step = [
+                b.mul_add(g[1], -d * g[0]) / det,
+                a.mul_add(-g[1], b * g[0]) / det,
+            ];
             let scale = (MAX_STEP / step[0].hypot(step[1])).min(1.0);
             joints[1] = clamp(joints[1] + scale * step[0], range(1));
             joints[2] = clamp(joints[2] + scale * step[1], range(2));

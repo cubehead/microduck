@@ -36,6 +36,8 @@ pub enum ParseError {
 }
 
 pub(crate) struct Body {
+    /// The MJCF `name`, retained for whole-skeleton FK (matching a pose to a link).
+    pub name: String,
     /// Index into `Tree::bodies`. `None` only for the root (trunk_base).
     pub parent: Option<usize>,
     /// Rest pose of this body in its parent's frame (identity for the root).
@@ -94,6 +96,7 @@ pub(crate) fn parse(xml: &str) -> Result<Tree, ParseError> {
     // The root is anchored at identity — its MJCF `pos` is where MuJoCo drops
     // the robot into the world, which trunk-frame FK must not inherit.
     tree.bodies.push(Body {
+        name: trunk.attribute("name").unwrap_or("trunk_base").to_owned(),
         parent: None,
         rest: Pose::IDENTITY,
         joint: None,
@@ -130,6 +133,7 @@ fn walk_body(node: roxmltree::Node, parent: usize, tree: &mut Tree) -> Result<()
 
     let idx = tree.bodies.len();
     tree.bodies.push(Body {
+        name: node.attribute("name").unwrap_or("").to_owned(),
         parent: Some(parent),
         rest: rest_pose(node)?,
         joint,
@@ -217,7 +221,7 @@ fn parse_floats_attr(
 }
 
 fn normalize(v: [f64; 3]) -> [f64; 3] {
-    let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    let n = v[2].mul_add(v[2], v[1].mul_add(v[1], v[0] * v[0])).sqrt();
     if n < 1e-12 {
         // A zero axis is a broken model; +z (MJCF's own default) keeps the
         // parse usable and the error visible in FK rather than as NaN.

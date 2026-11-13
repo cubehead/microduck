@@ -28,7 +28,8 @@ document is the update system only.
   (§5.5).
 - Trigger + monitor updates from the mobile app.
 - **Force-upgrade off known-bad releases** via a minimum-version floor.
-- Never brick a robot: atomic apply, automatic rollback, signed artifacts.
+- Never brick a robot: atomic apply, signed artifacts. Automatic rollback exists but is off by
+  default (§8).
 - Keep it simple; no fleet backend.
 - Be **reusable across the team's other robots** with minimal adaptation.
 - Support a per-component **post-install hook** for migrations / one-off steps.
@@ -43,7 +44,7 @@ document is the update system only.
 
 | Decision | Choice | Why |
 |---|---|---|
-| Update granularity | Application-level (not A/B image) | Only daemon + model change; OS is static. A/B (RAUC/Mender) would be over-engineering. |
+| Update granularity | Application-level (not A/B image) | Only daemon + model change; OS is static. A/B (RAUC/Mender) would be over-engineering. Since revisited for the Yocto image, which has A/B slots and its own updater — §11. |
 | Transport | Robot **pulls** from CDN over its own wifi | Robot has internet; phone is trigger + progress only. Big payloads never touch BLE. |
 | Hosting | **GitHub Releases** (daemon) + **HF Hub** (model) | Zero backend; each is a natural home for its artifact. Engine treats "source" as pluggable. |
 | Signing | **minisign** (CI signs, robot verifies) | Battle-tested format, tiny verify crate, simple key management. |
@@ -164,8 +165,8 @@ its own PR.
    engines in the same process, which surfaced as unrelated operations failing with `Busy` in the
    test suite.
 
-2. **A boot-time net outside `updaterd`**, for what slips through: a timer three minutes into each
-   boot asks whether the release brought its daemons up, and a `/bin/sh` rescue in the installed base
+2. **A boot-time net outside `updaterd`**, for what slips through: a check that watches each
+   boot for whether the release brought its daemons up, and a `/bin/sh` rescue in the installed base
    swaps `current` to golden if it did not. It has to live outside this process and outside the
    release, because the failure it exists for is an `updaterd` that does not start — at which point
    `recover_on_start` and the boot counter below are both unreachable. It cannot fix hardware: a
@@ -310,7 +311,7 @@ writes secret keys `0600`.
 | `release-1.pub/.key` | yes | password manager **and** CI secrets | every robot |
 | `release-2.pub/.key` | yes, **different passphrase** | password manager only — **never CI** | every robot |
 | `release-3.pub/.key` | yes, **different passphrase** | offline; ideally never on a networked machine | every robot |
-| `team.dev.pub/.key` | no | team store + CI | developer boards only |
+| `team.dev.pub/.key` | no | team store + CI | built into every `updaterd`, usable on dev boards only |
 
 Three things this table encodes, each easy to get wrong:
 
@@ -329,13 +330,43 @@ Releases are signed **in CI**, not locally — a deliberate choice, with the app
 that compensates for it documented in [`ci-setup.md`](../project/ci-setup.md).
 
 The dev key is deliberately unencrypted: CI signs non-interactively, and a passphrase
-stored beside the key it protects adds little. Its real protection is structural — it is
-absent from customer robots' trusted sets, and gated there by `allow_dev_keys = false`.
+stored beside the key it protects adds little. Its real protection is structural: it counts
+only on a robot that has been made a dev board.
+
+#### Dev boards
+
+Every `updaterd` carries the dev public key built in (`deploy/dev-key/team.dev.pub`, compiled
+into `updater::verify::BUILTIN_DEV_KEY`), always marked dev-only. A dev-only key is usable only
+when dev keys are allowed, and they are allowed when either of these holds:
+
+- the file `allow-dev-builds` (`duck_ipc_proto::DEV_BUILDS_MARKER`) exists in `state_dir` —
+  written by `sudo robotctl configure --allow-dev-daemon on`, removed by `off`, and toggled by
+  the `allow_dev_daemon` row of the `robotctl configure` editor; or
+- `allow_dev_keys = true` in `updater.toml` — what boards provisioned by `install.sh` with
+  `DUCK_DEV_KEY` carry, alongside a `team.dev.pub` copied into `trusted_keys_dir`.
+
+The marker is the supported way. It lives in `state_dir`, under `/var/lib/robot`, because on an
+A/B robot `/etc` belongs to the image and an OS update replaces it: a flag in `updater.toml` or a
+key file in `/etc/robot/trusted_keys` would quietly stop being there after the next OS update.
+And built in, rather than a file, because the file had to be copied by hand under exactly the
+right name — a copy not ending `.dev.pub` would have been trusted as a *release* key.
+
+So there is one barrier, not two: a root-only switch on the robot. That is what it is worth
+anyway — root on a robot can already install anything. Both are read at `updaterd` startup;
+the command restarts it. The shipped `updater.toml` keeps `allow_dev_keys = false`, and nothing
+ships the marker.
 
 ### 5.5 Models: one component each
 
 There are several models — walk, jump, stand, ground-pick — **each versioned
 independently**, and all loaded at once rather than one selected from many.
+
+**The control policies went the other way, and this section is the general rule rather than
+what they do.** They are produced as a family by one training run and the slot→file mapping
+depends on the drive mode, so they ship as a single `policies` component and a per-slot override
+covers the rest — see [`policy-channel-design.md`](policy-channel-design.md) §9. What stays true
+here is the shape: a component is a thing with its own version line, and a robot may have as many
+as it has such things.
 
 That is exactly what a *component* is: a thing with its own version line. So each
 model is its own entry in `updater.toml`, and no special store layout is needed:
@@ -388,7 +419,7 @@ The API version bumps when the interface changes — e.g. a model starts consumi
 An unreachable `robotd` makes this *unknown* rather than incompatible, which is a
 reason to wait for a model but not for the daemon — see §5.4's `Compatibility` note.
 
-### 5.6 Hardware: single target
+### 5.6 Hardware: one build, declared boards
 
 **Current target: Radxa Zero 3** (RK3566, Cortex-A55 → `aarch64`) running **Armbian
 26.2.x** with the **Debian 13 (Trixie)** userland, Rockchip BSP kernel 6.1.115.
@@ -418,22 +449,39 @@ What the container cannot cover, and hardware must: a real `systemctl restart`
 against the real filesystem, and whether the health-gate timeouts suit a robot that
 takes tens of seconds to stand up.
 
-**v1 targets one well-specified hardware configuration.** No board / variant /
-IMU / camera matrix, no per-device hardware profile, no artifact selection logic.
-The prototype's hardware variance is an artifact of exploration, not a
-requirement to carry forward.
+**Every board, one build.** The Zero 3W and the beta (with either face board) are all RK3566, so one aarch64 release
+runs on either. No variant / IMU / camera matrix, no per-device hardware profile, no artifact
+selection logic: what differs between the boards is the daemon's business, keyed on the board
+the robot declares, not the updater's.
 
-What we keep is deliberately minimal:
-- `min_hw_rev` in the manifest (§5.3) as a single forward-compatibility guard, so
-  a future board revision can refuse an incompatible artifact. One integer, no
-  matrix.
+What the updater keeps is deliberately minimal:
+- **`min_hw_rev`** in the manifest (§5.3): one integer, refused when it is above the robot's.
+- **The robot's revision is its declared board**: `[board] version` in `robotd.toml`
+  (`robotd_params::board::Board::hw_rev`: zero3 is 1, beta is 2, face-board-v1 is 3), read before every check.
+  `hw_rev` in `updater.toml` applies only when no board is declared — every robot installed
+  before the board was a setting carries `hw_rev = 1`, and a board provisioned against a
+  release that still shipped it does too, so it cannot be allowed to outrank the board.
 - A **stable device ID** for the update log (§8.3) and any future phone-home. The
-  SoC serial (`/proc/device-tree/serial-number`) works and survives reflashes —
-  no provisioning step needed to obtain it.
+  SoC serial works and survives reflashes — no provisioning step needed to obtain
+  it. Where it is read differs per board ([`app-path-design.md`](app-path-design.md) §8.2).
 
-If a second hardware target ever appears, the manifest gains constraints and the
-engine gains a match step. Not before — this is exactly the speculative
-complexity to avoid.
+#### Retiring a board
+
+A board is retired by giving it a last release, in `Board::last_release`. That one change
+does both halves:
+
+- **The warning.** From the release that sets it, `robotctl health` on that board says updates
+  end at that version. Set it a few releases ahead, so the warning is on robots for a while.
+- **The cut-off.** `xtask package` derives `min_hw_rev` from the table
+  (`board::min_hw_rev`): the lowest revision among the boards the release being packaged still
+  supports. The first release after a board's last is packaged above that board's revision, and
+  the updater already on the board refuses it — `requires hardware revision 2 or newer`. That
+  check has been in every updater since the first, so retiring a board needs nothing from the
+  robots being retired.
+
+`min_hw_rev` is one number, so boards retire oldest first; a test holds the table to that.
+A prerelease sorts below its release, so a dev build of a board's last release still installs
+on it.
 
 ### 5.7 Robot-specific state must survive updates
 
@@ -468,6 +516,18 @@ done only when genuinely needed, never unconditionally on every update.
   - **GitHub API** query for the newest tag matching a channel prefix
     (`daemon-v*`) — works with a single shared repo. Preferred if we keep both
     channels in one repo.
+
+  **Decided: the API, by tags.** `updaterd` reads `git/matching-refs/tags/<prefix>` — the
+  channel's tags only, filtered by GitHub — and takes the highest semver whose release exists,
+  is not a draft, and is not flagged prerelease (staging allows the flag). A tag with no release,
+  which is every release while it builds, falls through to the one below; five in a row is
+  reported. It does **not** list releases: that listing carries every dev build with all of its
+  assets, ~35 KB each, so its size follows the repository's activity rather than the channel's.
+  At 67 releases its first page passed the 1 MiB metadata cap and every robot stopped updating
+  (#421). Robots on 0.17.4 and older still read it, 100 per page, and 0.17.5 reads it 20 per
+  page; either breaks again when a page outgrows the cap, and only deleting releases unblocks
+  them. A dev ref never used either list: `--ref <branch>` asks
+  for `releases/tags/daemon-dev-<branch>` directly.
 - CI side: `cargo-dist` can build and publish signed artifacts to GitHub
   Releases; we host manifests as additional assets.
 
@@ -586,9 +646,19 @@ side effects:
   stopped/parked (motors safe). `updaterd` still does a light "safe to restart?"
   query to `robotd` and refuses if not — cheap insurance against restarting
   motor control mid-motion.
-- **No active remote session.** Restarting `robotd`/`mediad` mid-telepresence is a
-  bad surprise; refuse, or warn and require explicit confirmation. See
-  [`architecture.md`](architecture.md) §5.
+- **No active remote session.** Restarting `robotd`/`mediad` mid-call is a bad
+  surprise, so the check refuses while any WebRTC peer is connected, with
+  `SESSIONS_CONNECTED` (16) rather than `PREFLIGHT_FAILED` so a client can
+  tell it apart, and `interrupt_sessions` is the explicit confirmation. The count is `mediad`'s:
+  the `consumers` it writes to `/run/mediad/camera.json` every second, read
+  through `duck_ipc_proto::read_webrtc_peers`. A missing or stale file (over
+  5 s) passes, because the check is a courtesy and must never be what refuses
+  a recovery update. A request made over WebRTC by the only peer connected is
+  not refused for its own presence: `mediad` sets `interrupt_sessions` on it
+  before forwarding (`mediad/src/session.rs`, `Seat`). The rendezvous control
+  lane carries no media, so it is counted as its client's peer only while the
+  same remote session also holds the bridged video. A browser still
+  negotiating counts from the moment `webrtcsink` adds it, until it gives up.
 - **Disk space.** Storage is eMMC (finite, wear less of a concern than SD, but
   space still is). Verify free space for download + extract + `keep_previous`
   before starting.
@@ -641,6 +711,24 @@ and the next update that ships the unit reinstalls it.
 
 ## 8. Health gate & rollback
 
+**Automatic rollback is off by default.** `[update_gate] auto_rollback` in `robotd.toml` turns it
+on; `robotctl configure` has the row. Every path below that reverts without being asked — the gate
+after `update apply`, `select` or `rollback`, the boot counter, and the boot check
+([`boot-recovery-net.md`](boot-recovery-net.md)) — reads it at the moment it would act.
+
+Off is the default because releases now reach robots as tested Yocto images. A separate daemon
+update is the dev-board case, where someone is holding the robot. There, a revert nobody asked
+for does more damage than a broken release left in place: it replaces the code under whoever is
+looking at the robot, as the boot-counter incident below shows. This is a soft deprecation. The
+code stays, tested and one setting away.
+
+With it off, the gate still runs and still decides. A release that fails stays live, and the
+outcome is `Stuck` with a reason that names the command that reverts it
+(`robotctl update rollback <component>`). The trial is cleared, so the boot counter does not ask
+again. The update log records it as `Stuck`, not rolled back, so `known_bad` does not blacklist a
+release nobody reverted. `updaterd` reads the key through `Config::robotd_config`, both layers,
+on every decision. Missing, unreadable or not a bool reads as off.
+
 - After apply, the new `robotd` must clear a **healthy flag** within a
   per-component timeout (motors ack, model loads, media pipeline inits).
 - Belt-and-suspenders for hard hangs (not just clean failures):
@@ -664,6 +752,17 @@ and the next update that ships the unit reinstalls it.
 
     What still reverts is what this net is for: `robotd` unhealthy, unreachable, or answering in a
     shape this `updaterd` cannot read.
+
+    **And it asks the way the gate asks: polling, for the component's `health.timeout`.** Not one
+    question. `robotd` answers "control loop has not completed a cycle yet" from the moment its
+    socket opens until its first tick, and nothing orders `robotd.service` against
+    `updaterd.service` — so a single question at boot lands in that window often enough, and a
+    robot that is merely late reads as a release that failed. "Unreachable" is the same answer for
+    the same reason: at boot, a socket that is not there yet and a `robotd` that is never coming
+    back look identical, and only waiting tells them apart. The cost is paid on the boot that
+    reverts: recovery runs before the socket is served (§4 of `restart-order.md`), so a `robotd`
+    that never answers holds `updaterd` off `/run/updaterd.sock` for the whole timeout — 30s with
+    the shipped config — instead of the two seconds a single question took.
 - `keep_previous` (default 1) retained release dirs bound disk usage while
   always leaving a known-good target to roll back to.
 
@@ -882,6 +981,41 @@ cost — a re-signing schedule that, if missed, warns the entire fleet — is no
 paying before the publishing pipeline is routine. (2) is cheap but solves a problem
 §8.4.1 already covers at the version level.
 
+**(3) is built.** `update.status` carries `last_checked` per component, and `robotctl health`
+says when the update source last answered and warns once it has been quiet for a week. Only the
+source's latest counts, signed and for the right channel, so a failed fetch, a manifest that does
+not verify and a `--from` directory all leave it where it was. As the option says, it makes a robot
+that cannot reach its source visible, and not one being fed an old signed manifest; that is still
+(1).
+
+**A source that has never answered is the warning, not the silence.** A board that has been
+blocked since it was provisioned has nothing recorded — which is also what an `updaterd` older
+than `API_LAST_CHECKED` sends. `robotctl health` tells the two apart by the API version in the
+`hello` it already has, and warns on the first: a robot that has never reached its source is the
+worst case this report exists for, and reading it as "no news" prints what a healthy robot prints.
+
+**Each check is recorded too, answered or not, with why it failed.** Nothing recorded was still two
+states: checks that fail, and an `updaterd` that has not run its first one — every board for the
+minute after it starts, including right after the update that brought the record in, which warned
+that the source had never answered. `check-attempts.json` holds the last check per component and
+`update.status` carries it as `last_check_attempt` (`API_CHECK_ATTEMPT`). No attempt yet is a line,
+not a warning; attempts that failed are the warning, and it gives the error rather than pointing at
+the journal. An attempt is recorded under any clock, unlike the answer: a board whose clock has not
+synced is the one failing TLS, and dropping its attempts would read as one that has not checked.
+
+`robotctl update check` runs a check at once, and `robotctl health --check` runs one per component
+before reporting. It is a flag, not the default, because the login banner runs `health` and would
+otherwise wait on the network at every ssh.
+
+**It does depend on the clock**, unlike the option as listed above — a recorded time is only
+meaningful against the one reading it. Both directions are handled where they land rather than
+trusted: a time below §7.2's clock floor is not recorded at all (a board with no RTC, on a
+`local_dir` source that needs no TLS to answer, would otherwise report fifty years of silence the
+moment NTP arrives), and a time *ahead* of the reader's clock is reported as unknown and warned
+about rather than clamped to "just now" — a board whose clock was corrected backwards after a
+check would otherwise read as freshly checked for good, since only a successful check replaces the
+record.
+
 **Explicitly accepted for v1:** a robot whose network is hostile can be prevented
 from updating. It cannot be made to *downgrade*, install an artifact we did not
 sign, or install one that fails its health gate. Those are the properties we
@@ -1026,7 +1160,6 @@ parses it, so it cannot drift from the code. Abridged here:
 ```toml
 # /etc/robot/updater.toml
 trusted_keys_dir = "/etc/robot/trusted_keys"   # a *set* of keys (§5.4)
-hw_rev           = 1
 state_dir        = "/var/lib/robot/updater"    # must be outside every install_dir
 
 [component.daemon]
@@ -1070,6 +1203,37 @@ refused: `state_dir` inside an `install_dir` (a swap would destroy the update lo
 two components sharing an `install_dir`, relative paths, and `keep_previous = 0`
 with no golden (no rollback target).
 
+Two optional per-component guards reject a signed but unsuitable artifact:
+
+```toml
+[component.daemon]
+# Alongside source, install_dir and on_apply:
+required_files = ["bin/robotd", "bin/mediad"]
+max_artifact_bytes = 134217728 # compressed bytes, inclusive
+```
+
+`max_artifact_bytes` requires a declared `size` in the signed manifest. Both `check`
+and `apply` refuse a missing or over-budget size before fetching a new artifact;
+an already-installed version needs no download and bypasses this budget.
+`apply` also checks the downloaded file's actual size before extraction. This is
+an installation budget, not a per-transfer streaming limit: an underreported
+artifact is refused after download. The HTTP source's transfer limit and the
+global `max_uncompressed_bytes` / `max_archive_entries` extraction limits still apply.
+
+`required_files` is checked after verified extraction, before either hook or the
+live swap, including for a dry run. Entries must be nonempty relative file paths
+without `..`; directories and links resolving outside the extracted tree do not
+satisfy them. `check` does not download or inspect the archive, so it cannot verify
+this file list. A refusal leaves the installed release in place and removes staging.
+
+Omitted settings disable their respective guards. The shipped `deploy/updater.toml`
+enables `required_files` for every daemon release binary, including tools that no
+systemd unit executes; `xtask` tests keep that list matched to all packaging recipes.
+`max_artifact_bytes` remains unset. The installer pairs this config with its release
+through `DUCK_CONFIG_REF`, so the updater understands the shipped keys. When overriding
+that ref or adding these keys to an existing config, use an updater that understands
+them; older updaters reject unknown fields.
+
 
 Note the model uses `reload` (SIGHUP → re-mmap weights) rather than `restart`,
 so motor control is never dropped for a model swap. Per-component `on_apply` is
@@ -1079,16 +1243,67 @@ Shared across robots: engine, minisign pipeline, phone/BLE trigger protocol,
 rollback logic. Per-robot: the config file, the signing key, health probes,
 hooks. It's a small binary + a schema, not a framework.
 
-## 11. OS updates (deliberately out of scope for OTA)
+## 11. OS updates: `os.*`, on the boards that have slots
 
-Skipping A/B has one real constraint: we do not OTA the kernel/system libs.
-Mitigations:
-- Enable `unattended-upgrades` scoped to the Debian **security** pocket only,
-  for CVE patches. Set-and-forget.
-- Anything bigger (kernel bump, new system lib the daemon needs) = **re-flash at
-  service time**.
-- Minimize runtime deps on the base OS: static-ish linking, bundle what we can
-  inside the tarball, so a stock OS never blocks a daemon update.
+This section was "deliberately out of scope", and on an Armbian board it still
+is: one root filesystem, so nothing to switch to, and the mitigations stand —
+`unattended-upgrades` for the Debian security pocket, a re-flash for anything
+bigger, and a tarball that asks as little of the base OS as it can.
+
+A board flashed with a `microduck_yocto` image is different. It has two root
+filesystem slots, A and B, written by RAUC; and the image ships
+`microduck-osupdate`, which fetches a signed bundle from the channel the board
+follows, installs it to the slot not booted, reboots into it, and on the next
+boot records whether it came up. The bootloader boots the old slot again if the
+new one does not pass the health check. All of that is the image's —
+`microduck_yocto`'s `docs/agents/rauc.md` owns it.
+
+What lives here is the trigger. `updaterd` serves four methods for it
+(`API_VERSION` 46), and each one runs the script rather than re-implementing it,
+so the phone, `duckctl`, the image's LAN page on port 8090 and a shell on the
+robot all drive one updater:
+
+| Method | Gated | Does |
+|---|---|---|
+| `os.status` | no | the script's `status`: each slot's build, the channel's newest, phase, progress, `last_result` |
+| `os.check` | no | asks the channel; `BUSY` while an update runs |
+| `os.apply {build?}` | yes | the channel's newest, or a named build (older ones allowed); answers once the download is under way |
+| `os.switch` | yes | reboots into the other slot, downloading nothing — the undo; only a slot RAUC last saw good |
+
+Why not a component of `update.*`: a component is a store of releases swapped
+by a symlink, with `golden`, units restarted on apply and a health gate run by
+this engine. A slot has none of those, and its rollback is a reboot. Forcing it
+in would bend the engine for both.
+
+The two mutating calls take the engine lock (`BUSY` beside a daemon update —
+an OS update must not reboot the board halfway through a swap) and pass the
+same preflight as an apply: the robot is not moving and nobody is watching it
+remotely, `interrupt_sessions` lifting only the second. The clock check applies
+to `os.apply` alone, since a switch makes no HTTPS request. The work runs as the
+transient unit `microduck-osupdate-apply`, the one the 8090 page starts too, so
+each path sees the other's update as running.
+
+`os.apply` answers once the phase is past the script's checks, so a refusal the
+script makes at once — the build is already running, the channel has no
+manifest — is an error rather than a phase that turns `idle` a second later.
+The rest is the client's to follow: poll `os.status`, expect the link to drop
+at `rebooting`, and read `last_result` after the reboot.
+
+Routing: `btd` permits all four (§4.1's argument for `update.apply`, and the
+switch is the rollback), and so does `mediad`. Its transport has no
+authorisation of its own, but neither does the image's page on port 8090, which
+takes the same two mutations from the same LAN; through `mediad` they at least
+pass `updaterd`'s lock and preflight. The reboot drops a WebRTC session as it
+drops a BLE link, and the client rides it out the same way. Another peer's call
+is what the session check (§7.2) protects: with anyone else connected the
+update is refused, and the client asks again with `interrupt_sessions` once its
+user has agreed to drop them. A board with
+no script answers `NOT_SUPPORTED` (15). Nothing applies an OS update unattended:
+the periodic check does not look at the channel.
+
+Known gap, carried from the script: the channel's manifest is unsigned, so
+whoever can write the bucket can point a robot at an older, validly signed
+bundle. RAUC still refuses any bundle we did not sign.
 
 ### 11.1 Peripheral / MCU firmware — out of scope
 
@@ -1172,7 +1387,7 @@ Cheap additions that slot into the same IPC / engine and pay off:
   sign, copy, apply. Two things it does *not* do, both deliberate: it is not
   `updaterd install --from`, which forces `on_apply` and the gate off and therefore
   cannot be used on a live release; and it does not relax verification, which is why
-  it needs a dev key on the board rather than a flag that skips a check. The
+  it needs a dev board (§5.4) rather than a flag that skips a check. The
   downgrade guard stands aside for `--from` for the reason it stands aside for
   `--version` — an operator naming a directory is not a mirror that has gone
   backwards, and a local build is a prerelease that sorts below whatever the board is
@@ -1445,10 +1660,9 @@ Still open:
   That listener's blast radius is bounded by signature verification (an unsigned
   upload cannot install; worst case is filling the disk), but it wants a token
   and a deliberate bind regardless (`architecture.md` §2.2). Backup plan, not v1.
-- **Manifest staleness reporting** (§8.4.2) — surface "last successful check N
-  days ago" in `status` and the app, converting a freeze attack from silent to
-  visible. Cheap; recommended. Signed manifest expiry is the real defence but
-  carries a re-signing schedule, deferred until publishing is routine.
+- ~~**Manifest staleness reporting**~~ (§8.4.2), **built**: `update.status` carries
+  `last_checked`, and `robotctl health` warns when a source has been quiet for a week. Signed
+  manifest expiry is still the real defence, deferred until publishing is routine.
 - **Config ownership** — does config ride with the model bundle, the daemon, or
   become its own tiny channel? (Hooks handle migrations either way, §9.)
 - **Minimal success/failure phone-home** — one ping per update would let us catch
