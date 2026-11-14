@@ -36,6 +36,7 @@ pub mod agent;
 pub mod bluez;
 pub mod chorale;
 pub mod diagnostics;
+mod hardware;
 pub mod link;
 pub mod pairing;
 pub mod route;

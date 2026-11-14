@@ -561,7 +561,9 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// [`NetStatusResult::joining`]: while a `net.connect` is in flight, `net.status` says which
 /// network it is joining and how far it has got, so a client can show progress instead of a 45s
 /// spinner. Additive: absent from an older `configd`, and whenever no join is in flight.
-pub const API_VERSION: u32 = 57;
+/// v58 adds the authenticated BLE hardware snapshot and bounded audio tests.
+/// Deploy updated btd together with the matching robotd, mediad and audio socket unit.
+pub const API_VERSION: u32 = 58;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -4315,6 +4317,9 @@ pub struct LoopHealth {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BusHealth {
+    /// False for fake/simulated body IO; absent means older firmware, not real hardware.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub physical_io: Option<bool>,
     /// Consecutive failed reads; any success resets it. One is ordinary on a serial bus,
     /// which is why the cumulative count is not what is reported.
     pub consecutive_errors: u32,
@@ -6129,6 +6134,9 @@ pub fn publish_identity(service: &str, build: BuildInfo) -> Result<(), String> {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CameraStats {
+    /// False for test-pattern or simulated frames; absent means older firmware.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub physical_input: Option<bool>,
     /// Measured delivery rate at the pad before the tee, frames per second.
     ///
     /// Measured *there* on purpose: every other place in that pipeline sits behind something that
@@ -6406,6 +6414,7 @@ mod tests {
 
     fn camera_stats(consumers: u32) -> CameraStats {
         CameraStats {
+            physical_input: None,
             fps: 30.0,
             target_fps: 30,
             width: 1280,

@@ -388,7 +388,7 @@ stop_for_reinstall() {
     # Absent units are not a problem to report: a board running an older release simply has no
     # configd or btd, and warning about them on every forced re-install trains people to ignore
     # the warnings that matter.
-    for unit in padd.service netpadd.service tofd.service nfcd.service btd.service configd.service robotd.service updaterd.service; do
+    for unit in duck-audio-test.socket padd.service netpadd.service tofd.service nfcd.service btd.service configd.service robotd.service updaterd.service; do
         [ -f "${UNIT_DIR}/${unit}" ] || continue
         systemctl stop "$unit" 2>/dev/null || warn "could not stop ${unit}"
     done
@@ -637,7 +637,7 @@ stop_instead() {
 quiet_the_release_units() {
     [ -n "$NO_START" ] || return 0
     say "DUCK_NO_START: undoing the enables hooks/postinstall just did"
-    for unit in padd.service netpadd.service tofd.service nfcd.service btd.service configd.service robotd.service updaterd.service; do
+    for unit in duck-audio-test.socket padd.service netpadd.service tofd.service nfcd.service btd.service configd.service robotd.service updaterd.service; do
         [ -f "${UNIT_DIR}/${unit}" ] || continue
         stop_instead "$unit"
     done
@@ -686,7 +686,7 @@ install_units() {
     #
     # The release is the authority on what it contains. This script's job is to install it.
     shipped=""
-    for src in "${unit_src}"/*.service "${unit_src}"/*.timer; do
+    for src in "${unit_src}"/*.service "${unit_src}"/*.timer "${unit_src}"/*.socket; do
         [ -f "$src" ] || continue
         unit="$(basename "$src")"
         install -m 644 "$src" "${UNIT_DIR}/${unit}"
@@ -775,6 +775,10 @@ install_units() {
         enable_unit btd.service || warn "btd did not start; check:
     journalctl -u btd -b
   The robot works without it — only the phone path is unavailable."
+    fi
+
+    if [ -f "${UNIT_DIR}/duck-audio-test.socket" ]; then
+        enable_unit duck-audio-test.socket || warn "optional audio diagnostics socket did not start"
     fi
 
     # padd waits for a gamepad and drives when one connects, so it is safe to have running with

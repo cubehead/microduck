@@ -9,10 +9,11 @@ use duck_auth::{ProvisionedKey, RobotConfirm, Session};
 use duck_ble::framing::{self, Reassembler};
 use tokio::sync::mpsc;
 
-use crate::diagnostics;
 use crate::link::{Link, QUEUE};
 use crate::session;
 use crate::upstream::{Pool, Sockets};
+use crate::{diagnostics, hardware};
+use duck_ipc_proto as proto;
 
 /// iOS can retain the physical bond connection after its owning app exits.
 /// Only authenticated inbound requests renew the application session lease.
@@ -39,6 +40,9 @@ pub async fn run_with_diagnostics(
 ) {
     let (replies_tx, mut replies) = mpsc::channel::<String>(QUEUE);
     let config_socket = sockets.config.clone();
+    let hardware_sockets = sockets.clone();
+    let mut hardware_jobs = tokio::task::JoinSet::new();
+    let mut last_hardware_request = None::<tokio::time::Instant>;
     let mut pool = Pool::new(sockets, replies_tx);
     let mut diagnostic_subscriber = None::<diagnostics::Subscriber>;
     let mut inbound = Reassembler::new();
@@ -89,6 +93,30 @@ pub async fn run_with_diagnostics(
                                 }
                                 continue;
                             }
+                            if let Some(request) = hardware::parse(line) {
+                                let refusal = match request {
+                                    Ok((id, action)) => {
+                                        let now = tokio::time::Instant::now();
+                                        if hardware_jobs.is_empty() && last_hardware_request.is_none_or(|t| now - t >= std::time::Duration::from_millis(500)) {
+                                            last_hardware_request = Some(now);
+                                            let sockets = hardware_sockets.clone();
+                                            let snapshot = shared.clone();
+                                            hardware_jobs.spawn(async move {
+                                                let result = hardware::execute(action, sockets, snapshot).await;
+                                                proto::Response::ok(Some(id), &result)
+                                            });
+                                            continue;
+                                        }
+                                        Some(proto::Response::ok(Some(id), &serde_json::json!({"version":1,"state":"busy"})))
+                                    }
+                                    Err(Some(id)) => Some(proto::Response::err(Some(id), proto::Error::new(proto::code::INVALID_PARAMS, "expected no parameters"))),
+                                    Err(None) => None,
+                                };
+                                if let Some(refusal) = refusal {
+                                    if send_hardware_response(&link, secure, refusal).await.is_err() { return }
+                                }
+                                continue;
+                            }
                             let outcome = session::dispatch(
                                 &mut pool, &config_socket, line, &mut authenticated, &mut unused_attempts,
                             ).await;
@@ -114,6 +142,12 @@ pub async fn run_with_diagnostics(
                     if send_frame(&link, Frame::Data(ciphertext)).await.is_err() { return }
                 }
             }
+            job = hardware_jobs.join_next(), if !hardware_jobs.is_empty() => {
+                let State::Ready(secure) = &mut state else { return };
+                if let Some(Ok(reply)) = job {
+                    if send_hardware_response(&link, secure, reply).await.is_err() { return }
+                }
+            }
             line = replies.recv(), if matches!(state, State::Ready(_)) => {
                 let Some(line) = line else { break };
                 let State::Ready(secure) = &mut state else { return };
@@ -123,6 +157,16 @@ pub async fn run_with_diagnostics(
             }
         }
     }
+}
+
+async fn send_hardware_response(
+    link: &Link,
+    secure: &mut Session,
+    reply: proto::Response,
+) -> Result<(), ()> {
+    let bytes = serde_json::to_vec(&reply).map_err(|_| ())?;
+    let ciphertext = secure.seal(&bytes).map_err(|_| ())?;
+    send_frame(link, Frame::Data(ciphertext)).await
 }
 
 async fn send_frame(link: &Link, frame: Frame) -> Result<(), ()> {
@@ -238,6 +282,28 @@ mod tests {
                 .await
                 .is_err()
         );
+        let status = br#"{"jsonrpc":"2.0","id":3,"method":"robot.hardwareStatus"}"#;
+        send(&to_robot, Frame::Data(phone.seal(status).unwrap())).await;
+        let Frame::Data(reply) = receive(&mut from_robot, &mut assembly).await else {
+            panic!("hardware snapshot")
+        };
+        let value: serde_json::Value =
+            serde_json::from_slice(&phone.open(&reply).unwrap()).unwrap();
+        assert_eq!(value["id"], 3);
+        assert_eq!(value["result"]["version"], 1);
+        assert_eq!(value["result"]["servo"]["state"], "unknown");
+        assert!(!value["result"]["mic"]["state"].is_null());
+
+        // A client cannot change recording configuration or supply an output path.
+        let invalid = br#"{"jsonrpc":"2.0","id":4,"method":"robot.hardwareMicTest","params":{"path":"capture.wav"}}"#;
+        send(&to_robot, Frame::Data(phone.seal(invalid).unwrap())).await;
+        let Frame::Data(reply) = receive(&mut from_robot, &mut assembly).await else {
+            panic!("invalid audio test")
+        };
+        let value: serde_json::Value =
+            serde_json::from_slice(&phone.open(&reply).unwrap()).unwrap();
+        assert_eq!(value["id"], 4);
+        assert_eq!(value["error"]["code"], proto::code::INVALID_PARAMS);
         drop(to_robot);
         task.await.unwrap();
         assert!(from_robot.recv().await.is_none());

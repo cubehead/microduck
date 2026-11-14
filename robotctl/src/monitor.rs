@@ -3819,6 +3819,7 @@ mod tests {
             motors: None,
             cpu_temp_c: Some(48.0),
             bus: proto::BusHealth {
+                physical_io: None,
                 consecutive_errors: 0,
                 startup_failures: 3,
                 ..Default::default()
@@ -3847,6 +3848,7 @@ mod tests {
             degraded: true,
             reason: Some("servos 32 head_yaw, 33 head_roll, 34 mouth not answering".to_owned()),
             bus: proto::BusHealth {
+                physical_io: None,
                 startup_failures: 3,
                 missing: vec![32, 33, 34],
                 ..Default::default()

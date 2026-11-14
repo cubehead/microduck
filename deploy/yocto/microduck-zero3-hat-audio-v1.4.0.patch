@@ -1,0 +1,343 @@
+diff --git a/docs/agents/zero3-hat-audio.md b/docs/agents/zero3-hat-audio.md
+new file mode 100644
+index 0000000..2847127
+--- /dev/null
++++ b/docs/agents/zero3-hat-audio.md
+@@ -0,0 +1,87 @@
++# Radxa Zero 3W Pollen Robot HAT audio candidate
++
++For the Radxa Zero 3W with the Pollen Robot HAT, codec at 0x18 and a 12 MHz
++codec oscillator. This is not for the bare board, the beta board (RK809 and
++face mic), or an unconfirmed custom audio circuit.
++
++## Build and update boundary
++
++Use a working upstream kas/Docker build environment and the daemon release
++as described in README. Opt into the separate HAT image:
++
++```sh
++KAS_FILES=kas/microduck.yml:kas/zero3-hat-audio.yml \
++  DAEMON_VERSION=0.20.1 scripts/build-local.sh build --target microduck-image
++```
++
++Check that the build's kernel configuration includes all five settings in
++`microduck-zero3-hat-audio.cfg`; the recipe already fails if any is lost.
++Check the booted slot's `/boot/microduck.dtb` (not only a loose DTBO) and the
++image package manifest for `microduck-zero3-hat-audio` and
++`alsa-utils-amixer`. This changes the DTB, which is also used to derive the
++boot partition. Do not transplant the change into a stock updater bundle,
++or treat a daemon-only update as a driver update. Build a separate WIC and
++verify both slots, boot, and rollback on a spare card before distribution.
++The recipe does not issue a flash command.
++
++## Wiring and behavior
++
++* RK3566 I2S3 stays on its stock M0 PCM pins; this enables its existing DAI.
++  The RK3566 is the bit-clock/frame master, its sysclk is 12.288 MHz, and
++  the codec clock reference is the HAT's separate 12 MHz oscillator.
++* Header 3/5 are GPIO1_A0/A1; the new `i2c-gpio` bus uses open drain and
++  the HAT pullups. There is no assumption about its Linux bus number. The
++  built-in codec driver binds to `ti,tlv320aic3x`; that compatible preserves
++  the upstream HAT mixer control names. USB-C PD's FUSB302 stays on the
++  existing hardware I2C3 M1 (GPIO3_B5/B6). This only preserves topology;
++  actual USB-C behavior still needs a board test.
++* The package initializes only card `aic3104`, output and MIC3R routing,
++  with a conservative 0 dB line stage. It logs a missing card and exits
++  after a short wait. It is ordered before robotd, not a hard dependency.
++* No ToF driver, address, bus route, app audio permission, recording
++  automation, sound bank, or motion configuration is changed. The existing
++  voice bank service and stock `audio.pet_detect` policy remain in force.
++
++## Bench verification (no motor commands)
++
++1. Keep the robot stationary with servo power off. Check the card and
++   its playback and capture directions before changing application settings:
++
++   ```sh
++   cat /proc/asound/cards
++   aplay -l
++   arecord -l
++   journalctl -b -u microduck-zero3-hat-audio -u microduck-voice-bank -u robotd --no-pager
++   amixer -c aic3104 scontents
++   ```
++
++2. Use a known WAV to verify speaker routing with the duck at a distance.
++   Then test the daemon separately with `robotctl quack`.
++
++   ```sh
++   aplay -q -D plughw:CARD=aic3104,DEV=0 /opt/robot/daemon/current/emotions/yes.wav
++   ```
++
++3. Tell the nearby participants before enabling the mic. While no other
++   process holds capture, record locally for five seconds at stereo 48 kHz
++   so the HAT's right channel can be checked. Use a private temp directory
++   and remove this particular debug recording when done.
++
++   ```sh
++   scratch=$(mktemp -d)
++   arecord -q -D hw:CARD=aic3104,DEV=0 -f S16_LE -r 48000 -c 2 -t wav -d 5 "$scratch/mic.wav"
++   aplay -q -D plughw:CARD=aic3104,DEV=0 "$scratch/mic.wav"
++   rm -f "$scratch/mic.wav"
++   rmdir "$scratch"
++   ```
++
++   If capture answers with `Device or resource busy`, find the current
++   consumer instead of restarting robotd on a running robot. If the left
++   channel is quiet, inspect the right channel before changing gain: MIC3R
++   is intended to be right-only. A headphone/speaker test alone does not
++   show what the daemon's 16 kHz mono software conversion receives.
++
++4. Reboot once, confirm the mixer route is restored, test the stock USB-C
++   power/role behavior, and confirm BLE, camera, motor bus and any existing
++   ToF wiring have not regressed. The image is not hardware-accepted until
++   microphone levels and the actual speaker are both checked on this HAT.
+diff --git a/kas/zero3-hat-audio.yml b/kas/zero3-hat-audio.yml
+new file mode 100644
+index 0000000..7b7206f
+--- /dev/null
++++ b/kas/zero3-hat-audio.yml
+@@ -0,0 +1,7 @@
++# Compose after kas/microduck.yml for a Radxa Zero 3W with Pollen Robot HAT.
++header:
++  version: 14
++
++local_conf_header:
++  zero3-hat-audio: |
++    MICRODUCK_ZERO3_HAT_AUDIO = "1"
+diff --git a/meta-microduck-bsp/conf/machine/microduck-zero3.conf b/meta-microduck-bsp/conf/machine/microduck-zero3.conf
+index cf68f22..cff15bd 100644
+--- a/meta-microduck-bsp/conf/machine/microduck-zero3.conf
++++ b/meta-microduck-bsp/conf/machine/microduck-zero3.conf
+@@ -11,7 +11,8 @@ require conf/machine/include/microduck-common.inc
+ # AP6212. Pinned to the single matching device tree on purpose: with more than one
+ # entry, linux-rockchip.inc derives a Rockchip boot.img target per DTB but only
+ # one boot.img gets deployed, so which variant it carries is ambiguous.
+-KERNEL_DEVICETREE = "rockchip/rk3566-radxa-zero-3w-aic8800ds2.dtb"
++KERNEL_DEVICETREE = "${@bb.utils.contains('MICRODUCK_ZERO3_HAT_AUDIO', '1', 'rockchip/rk3566-microduck-zero3-hat-audio.dtb', 'rockchip/rk3566-radxa-zero-3w-aic8800ds2.dtb', d)}"
++MICRODUCK_BOARD_DTS = "${@bb.utils.contains('MICRODUCK_ZERO3_HAT_AUDIO', '1', 'rk3566-microduck-zero3-hat-audio.dts', '', d)}"
+ 
+ # Same as rockchip-rk3566-evb.conf: meta-rockchip's u-boot-rockchip is Rockchip
+ # downstream U-Boot 2017.09, built via `make.sh rk3568` with DRAM init coming
+@@ -93,3 +94,7 @@ WKS_FILE = "microduck-ab.wks.in"
+ # Deliberately not pulling in rkwifibt-firmware or brcm-tools: those are Broadcom
+ # and this board has none.
+ RK_WIFIBT_RRECOMMENDS = "aic8800"
++
++# The bare Zero 3W does not have the Pollen Robot HAT audio codec. Enable
++# explicitly with kas/zero3-hat-audio.yml on boards wired for that HAT.
++MICRODUCK_ZERO3_HAT_AUDIO ??= "0"
+diff --git a/meta-microduck-bsp/recipes-bsp/microduck-zero3-hat-audio/files/microduck-zero3-hat-audio-init b/meta-microduck-bsp/recipes-bsp/microduck-zero3-hat-audio/files/microduck-zero3-hat-audio-init
+new file mode 100644
+index 0000000..c738439
+--- /dev/null
++++ b/meta-microduck-bsp/recipes-bsp/microduck-zero3-hat-audio/files/microduck-zero3-hat-audio-init
+@@ -0,0 +1,32 @@
++#!/bin/sh
++# Mixer controls match pollen-robotics/microduck deploy/audio/aic3104-init.sh.
++set -eu
++
++# Probe the named card, not card0 (which could be HDMI or USB audio).
++# Wait briefly for deferred probe, without making robotd depend on the codec.
++attempt=0
++while ! amixer -c aic3104 info >/dev/null 2>&1; do
++    attempt=$((attempt + 1))
++    if [ "$attempt" -ge 8 ]; then
++        echo "aic3104 sound card not detected; Robot HAT audio was not initialized" >&2
++        exit 0
++    fi
++    sleep 0.25
++done
++
++# Set route and level before unmuting. Leave the output-stage boost at 0 dB.
++amixer -q -c aic3104 cset name='PCM Playback Volume' 127,127
++amixer -q -c aic3104 cset name='Line DAC Playback Volume' 118,118
++amixer -q -c aic3104 cset name='Line Playback Volume' 0,0
++amixer -q -c aic3104 cset name='Line Playback Switch' on,on
++
++# The HAT's local microphone is wired to Mic3R of the right PGA.
++for input in 'Left PGA Mixer Mic3R' 'Left PGA Mixer Mic3L' \
++             'Right PGA Mixer Mic3L' 'Right PGA Mixer Line1R' 'Right PGA Mixer Line1L' \
++             'Left PGA Mixer Line1R' 'Left PGA Mixer Line1L' 'Right PGA Mixer Line2R'; do
++    amixer -q -c aic3104 sset "$input" off
++done
++amixer -q -c aic3104 sset 'Right PGA Mixer Mic3R' on
++amixer -q -c aic3104 cset name='PGA Capture Volume' 60,60
++amixer -q -c aic3104 cset name='PGA Capture Switch' on,on
++echo "aic3104 speaker and MIC3R mixer initialized"
+diff --git a/meta-microduck-bsp/recipes-bsp/microduck-zero3-hat-audio/files/microduck-zero3-hat-audio.service b/meta-microduck-bsp/recipes-bsp/microduck-zero3-hat-audio/files/microduck-zero3-hat-audio.service
+new file mode 100644
+index 0000000..6c0c2d1
+--- /dev/null
++++ b/meta-microduck-bsp/recipes-bsp/microduck-zero3-hat-audio/files/microduck-zero3-hat-audio.service
+@@ -0,0 +1,15 @@
++[Unit]
++Description=Initialize Zero 3W Robot HAT speaker and microphone mixer
++Before=robotd.service
++
++[Service]
++Type=oneshot
++RemainAfterExit=yes
++TimeoutStartSec=5s
++ExecStart=@LIBEXECDIR@/microduck-zero3-hat-audio-init
++NoNewPrivileges=yes
++ProtectSystem=strict
++ProtectHome=yes
++
++[Install]
++WantedBy=multi-user.target
+diff --git a/meta-microduck-bsp/recipes-bsp/microduck-zero3-hat-audio/microduck-zero3-hat-audio.bb b/meta-microduck-bsp/recipes-bsp/microduck-zero3-hat-audio/microduck-zero3-hat-audio.bb
+new file mode 100644
+index 0000000..0fc5745
+--- /dev/null
++++ b/meta-microduck-bsp/recipes-bsp/microduck-zero3-hat-audio/microduck-zero3-hat-audio.bb
+@@ -0,0 +1,28 @@
++SUMMARY = "Mixer setup for the Zero 3W Pollen Robot HAT"
++DESCRIPTION = "Initializes the AIC3104 speaker and MIC3R capture paths at boot."
++LICENSE = "MIT"
++LIC_FILES_CHKSUM = "file://${COREBASE}/meta/COPYING.MIT;md5=3da9cfbcb788c80a0384361b4de20420"
++
++SRC_URI = " \
++    file://microduck-zero3-hat-audio.service \
++    file://microduck-zero3-hat-audio-init \
++"
++
++S = "${UNPACKDIR}"
++PACKAGE_ARCH = "${MACHINE_ARCH}"
++COMPATIBLE_MACHINE = "^microduck-zero3$"
++
++inherit systemd
++
++SYSTEMD_SERVICE:${PN} = "microduck-zero3-hat-audio.service"
++SYSTEMD_AUTO_ENABLE = "enable"
++
++RDEPENDS:${PN} = "alsa-utils-amixer"
++
++do_install() {
++	install -d ${D}${libexecdir} ${D}${systemd_system_unitdir}
++	install -m 0755 ${UNPACKDIR}/microduck-zero3-hat-audio-init ${D}${libexecdir}/
++	install -m 0644 ${UNPACKDIR}/microduck-zero3-hat-audio.service ${D}${systemd_system_unitdir}/
++	# Honor the distro's libexecdir rather than assuming an install prefix.
++	sed -i 's|@LIBEXECDIR@|${libexecdir}|g' ${D}${systemd_system_unitdir}/microduck-zero3-hat-audio.service
++}
+diff --git a/meta-microduck-bsp/recipes-kernel/linux/files/microduck-zero3-hat-audio.cfg b/meta-microduck-bsp/recipes-kernel/linux/files/microduck-zero3-hat-audio.cfg
+new file mode 100644
+index 0000000..0a0b1f0
+--- /dev/null
++++ b/meta-microduck-bsp/recipes-kernel/linux/files/microduck-zero3-hat-audio.cfg
+@@ -0,0 +1,5 @@
++CONFIG_I2C_GPIO=y
++CONFIG_SND_SOC_TLV320AIC3X=y
++CONFIG_SND_SOC_TLV320AIC3X_I2C=y
++CONFIG_SND_SIMPLE_CARD=y
++CONFIG_SND_SOC_ROCKCHIP_I2S_TDM=y
+diff --git a/meta-microduck-bsp/recipes-kernel/linux/files/rk3566-microduck-zero3-hat-audio.dts b/meta-microduck-bsp/recipes-kernel/linux/files/rk3566-microduck-zero3-hat-audio.dts
+new file mode 100644
+index 0000000..d737bc2
+--- /dev/null
++++ b/meta-microduck-bsp/recipes-kernel/linux/files/rk3566-microduck-zero3-hat-audio.dts
+@@ -0,0 +1,65 @@
++// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
++// HAT variant of the stock Linux device tree, with the same radio and camera.
++#include "rk3566-radxa-zero-3w-aic8800ds2.dts"
++
++// Pollen Robot HAT on header pins 3 (SDA) and 5 (SCL).  Leave
++// the SoC hardware i2c3 at M1 for the board's FUSB302 USB-C PD.
++&{/} {
++	pihat_i2c: i2c-pihat {
++		compatible = "i2c-gpio";
++		sda-gpios = <&gpio1 RK_PA0 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		scl-gpios = <&gpio1 RK_PA1 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++		i2c-gpio,delay-us = <5>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&pihat_i2c_pins>;
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		pihat_codec: codec@18 {
++			// Keep the control names expected by the upstream HAT mixer.
++			compatible = "ti,tlv320aic3x";
++			reg = <0x18>;
++			#sound-dai-cells = <0>;
++			clocks = <&pihat_codec_mclk>;
++			clock-names = "mclk";
++		};
++	};
++
++	pihat_codec_mclk: aic3104-mclk {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <12000000>;
++	};
++
++	sound-aic3104 {
++		compatible = "simple-audio-card";
++		simple-audio-card,name = "aic3104";
++		simple-audio-card,format = "i2s";
++		simple-audio-card,bitclock-master = <&pihat_cpu_dai>;
++		simple-audio-card,frame-master = <&pihat_cpu_dai>;
++
++		pihat_cpu_dai: simple-audio-card,cpu {
++			sound-dai = <&i2s3_2ch>;
++			// Do not set mclk-fs on the card: the codec's physical
++			// 12 MHz oscillator is independent of the RK3566 sysclk.
++			system-clock-frequency = <12288000>;
++		};
++
++		simple-audio-card,codec {
++			sound-dai = <&pihat_codec>;
++		};
++	};
++};
++
++&pinctrl {
++	pihat {
++		pihat_i2c_pins: pihat-i2c-pins {
++			rockchip,pins = <1 RK_PA0 RK_FUNC_GPIO &pcfg_pull_none>,
++					<1 RK_PA1 RK_FUNC_GPIO &pcfg_pull_none>;
++		};
++	};
++};
++
++&i2s3_2ch {
++	status = "okay";
++};
+diff --git a/meta-microduck-bsp/recipes-kernel/linux/linux-rockchip_6.1.bbappend b/meta-microduck-bsp/recipes-kernel/linux/linux-rockchip_6.1.bbappend
+index f6ad6da..17f72e6 100644
+--- a/meta-microduck-bsp/recipes-kernel/linux/linux-rockchip_6.1.bbappend
++++ b/meta-microduck-bsp/recipes-kernel/linux/linux-rockchip_6.1.bbappend
+@@ -160,6 +160,10 @@ SRC_URI += "${@bb.utils.contains('MICRODUCK_MOTOR_UART', '1', 'file://motorbus.c
+ # Zero 3W dts on a beta build -- harmless, that dts is simply not built there.)
+ SRC_URI:append:microduck-zero3 = " file://0003-rk3566-radxa-zero-3w-radxa-camera-8m-imx219.patch"
+ 
++# Optional Pollen Robot HAT audio, distinct from AIC8800 Wi-Fi/BT. The GPIO
++# bus on header pins 3/5 leaves the vendor hardware I2C3 mux and FUSB302 intact.
++SRC_URI:append:microduck-zero3 = "${@bb.utils.contains('MICRODUCK_ZERO3_HAT_AUDIO', '1', ' file://microduck-zero3-hat-audio.cfg', '', d)}"
++
+ # A board whose device tree lives in this layer rather than in any kernel tree.
+ # The machine conf names the file (MICRODUCK_BOARD_DTS); it is copied into the
+ # kernel source after patching and listed in the rockchip dts Makefile, so the
+@@ -169,8 +173,8 @@ SRC_URI:append:microduck-zero3 = " file://0003-rk3566-radxa-zero-3w-radxa-camera
+ #
+ # A file rather than a patch because it is a whole new board in bring-up: it will
+ # be edited constantly against a schematic that is itself older than the boards,
+-# and a readable .dts diffs better than a patch of one. Empty for the Zero 3W,
+-# whose device tree is radxa's own plus the patches above.
++# and a readable .dts diffs better than a patch of one. The bare Zero 3W uses
++# Radxa's DTS plus the patches above; the opt-in HAT variant includes that DTS.
+ #
+ # A list, because a board variant's DTS can #include another one
+ # (microduck-face-board-v1 includes the beta's): every file is copied and built,
+diff --git a/meta-microduck/recipes-core/images/microduck-image.bb b/meta-microduck/recipes-core/images/microduck-image.bb
+index 66acc80..a28b057 100644
+--- a/meta-microduck/recipes-core/images/microduck-image.bb
++++ b/meta-microduck/recipes-core/images/microduck-image.bb
+@@ -145,6 +145,9 @@ IMAGE_INSTALL:append = " \
+ # The beta's face LEDs, ToF and NFC reader, for the daemons' groups (robot, nfcd).
+ IMAGE_INSTALL:append:microduck-beta = " microduck-face-leds microduck-tof-spidev microduck-nfc"
+ 
++# Mixer tooling for the opt-in Zero 3W HAT DTB, not for the bare board.
++IMAGE_INSTALL:append:microduck-zero3 = "${@bb.utils.contains('MICRODUCK_ZERO3_HAT_AUDIO', '1', ' microduck-zero3-hat-audio', '', d)}"
++
+ # bluez5, iw, wpa-supplicant, wireless-regdb-static, usbutils: from packagegroup-base via MACHINE_FEATURES.
+ # rauc would arrive via packagegroup-base too; listed to keep the updater visible.
+ 

@@ -720,6 +720,7 @@ pub fn start(
         width,
         height,
         fps,
+        matches!(&source, Source::Camera(_)),
         consumers.clone(),
     )?;
 
@@ -1957,6 +1958,7 @@ fn meter_capture_rate(
     width: u32,
     height: u32,
     fps: u32,
+    physical_input: bool,
     consumers: Consumers,
 ) -> Result<()> {
     let target = fps as f64;
@@ -2007,6 +2009,7 @@ fn meter_capture_rate(
                 meter.window_start = std::time::Instant::now();
 
                 let stats = proto::CameraStats {
+                    physical_input: Some(physical_input),
                     fps: (measured * 10.0).round() / 10.0,
                     target_fps: fps,
                     width,

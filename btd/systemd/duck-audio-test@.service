@@ -1,0 +1,31 @@
+[Unit]
+Description=Microduck local audio diagnostic request
+
+[Service]
+Type=oneshot
+ExecStart=/opt/robot/daemon/current/bin/duck-audio-test
+User=duck-audio-test
+Group=duck-audio-test
+SupplementaryGroups=audio
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+TimeoutStartSec=5s
+TimeoutStopSec=1s
+RuntimeDirectory=duck-audio-test
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+DevicePolicy=closed
+DeviceAllow=char-alsa rw
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+CapabilityBoundingSet=

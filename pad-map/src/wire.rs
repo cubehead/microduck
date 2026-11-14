@@ -394,6 +394,7 @@ mod tests {
                     max_khz: 1_800_000,
                 }),
                 bus: proto::BusHealth {
+                    physical_io: None,
                     consecutive_errors: 3,
                     startup_failures: 0,
                     missing: (10..25).collect(),

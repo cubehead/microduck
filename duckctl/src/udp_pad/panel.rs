@@ -933,6 +933,7 @@ mod tests {
                     mean_c: 44.0,
                 }),
                 bus: proto::BusHealth {
+                    physical_io: None,
                     missing: vec![10],
                     ..Default::default()
                 },

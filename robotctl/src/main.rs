@@ -7120,6 +7120,7 @@ mod tests {
 
     fn camera_stats(fps: f64, dropped: u64, consumers: u32) -> proto::CameraStats {
         proto::CameraStats {
+            physical_input: None,
             fps,
             target_fps: 30,
             width: 1280,
@@ -7392,6 +7393,7 @@ mod tests {
                 healthy: false,
                 reason: Some("7 consecutive bus read failures".into()),
                 bus: proto::BusHealth {
+                    physical_io: None,
                     consecutive_errors: 7,
                     startup_failures: 0,
                     ..Default::default()
@@ -7426,6 +7428,7 @@ mod tests {
                         .into(),
                 ),
                 bus: proto::BusHealth {
+                    physical_io: None,
                     startup_failures: 4,
                     ..Default::default()
                 },
@@ -7547,6 +7550,7 @@ mod tests {
                 degraded: true,
                 reason: Some("no robot on the motor bus after 4 attempts".into()),
                 bus: proto::BusHealth {
+                    physical_io: None,
                     consecutive_errors: 0,
                     startup_failures: 4,
                     ..Default::default()
@@ -7571,6 +7575,7 @@ mod tests {
             Some(proto::HealthResult {
                 degraded: true,
                 bus: proto::BusHealth {
+                    physical_io: None,
                     startup_failures: 4,
                     missing: vec![32, 33, 34],
                     ..Default::default()
@@ -7590,6 +7595,7 @@ mod tests {
             Some(proto::HealthResult {
                 degraded: true,
                 bus: proto::BusHealth {
+                    physical_io: None,
                     startup_failures: 4,
                     missing: proto::JOINT_IDS.to_vec(),
                     ..Default::default()

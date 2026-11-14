@@ -128,7 +128,7 @@ fi
 # release, and the supported way to customise one is a drop-in under
 # /etc/systemd/system/<unit>.d/, which this does not touch.
 units=""
-for unit in systemd/*.service systemd/*.timer; do
+for unit in systemd/*.service systemd/*.timer systemd/*.socket; do
     [ -f "$unit" ] || continue
     name="$(basename "$unit")"
     install -m 644 "$unit" "${UNIT_DIR}/${name}" \

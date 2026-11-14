@@ -129,7 +129,7 @@ pub fn request(line: &str) -> Option<(String, bool)> {
     ))
 }
 
-async fn query(path: &std::path::Path, call: proto::Call) -> Option<Value> {
+pub(crate) async fn query(path: &std::path::Path, call: proto::Call) -> Option<Value> {
     timeout(IPC_TIMEOUT, async {
         let mut conn = UnixStream::connect(path).await.ok()?;
         let mut bytes =
@@ -168,7 +168,7 @@ fn battery(value: &Value) -> Option<(u32, u32)> {
     Some((percent.round() as u32, mv.round() as u32))
 }
 
-fn bus_ready_for_battery(value: &Value) -> bool {
+pub(crate) fn bus_ready_for_battery(value: &Value) -> bool {
     value.get("healthy").and_then(Value::as_bool) == Some(true)
         && value
             .pointer("/bus/consecutive_errors")
@@ -218,6 +218,14 @@ impl Shared {
     pub async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
         self.0.changed().await
     }
+    /// Read the same cached battery displayed by the notification, without consuming a
+    /// pending change or sending a new request to the motor bus.
+    pub(crate) fn hardware_battery(&self) -> Option<(u64, u32, u32)> {
+        let snapshot = self.0.borrow();
+        let (pct, mv) = snapshot.display.battery?;
+        Some((snapshot.battery_age_ms?, pct, mv))
+    }
+
     pub fn mark_current(&mut self) -> Snapshot {
         self.0.borrow_and_update().clone()
     }

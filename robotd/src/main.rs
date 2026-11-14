@@ -765,6 +765,7 @@ struct RobotState {
     /// accepting it into silence. Read once at startup, like the policies: the postinstall
     /// renders the bank and restarts robotd, so a bank cannot appear under a running one.
     has_voice: bool,
+    physical_io: Option<bool>,
     /// The emotions `robot.do` plays, from `[emotions] dir`. Read once at startup, like the voice
     /// bank: adding one is copying its files and restarting this daemon.
     emotions: emotion::Library,
@@ -871,6 +872,7 @@ impl RobotState {
             policy_enabled: params.policy.enabled,
             config_path: config_path.to_owned(),
             has_voice: params.audio.enabled && has_any_wav(&params.audio.bank),
+            physical_io: None,
             emotions: emotion::Library::load_release(&params.emotions.dir),
             theremin_ready: AtomicBool::new(false),
             theremin_allowed: params.theremin.enabled && params.audio.enabled,
@@ -915,6 +917,7 @@ impl RobotState {
                 cpu_throttle: self.cpu_throttle.load_full().map(|t| *t),
                 control_loop: Some(self.loop_health()),
                 bus: proto::BusHealth {
+                    physical_io: self.physical_io,
                     consecutive_errors: self.consecutive_errors.load(Ordering::Relaxed),
                     startup_failures: self.startup_bus_failures.load(Ordering::Relaxed),
                     missing: self.bus_missing.load().as_ref().clone(),
@@ -1033,6 +1036,7 @@ impl RobotState {
     /// of failed reads on a running loop.
     fn silent_hardware(&self, after: &str) -> Option<String> {
         let bus = proto::BusHealth {
+            physical_io: None,
             missing: self.bus_missing.load().as_ref().clone(),
             ..Default::default()
         };
@@ -1214,6 +1218,7 @@ async fn main() -> ExitCode {
     let vetbook_path = args.vetbook.clone().or_else(|| {
         (!args.fake && args.sim.is_none()).then(|| PathBuf::from(vetbook::DEFAULT_PATH))
     });
+    state.physical_io = Some(!args.fake && args.sim.is_none());
     state.vetbook = vetbook::Book::open(vetbook_path, env!("CARGO_PKG_VERSION"));
     let state = Arc::new(state);
 
