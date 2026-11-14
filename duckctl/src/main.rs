@@ -42,6 +42,7 @@
 #[cfg(target_os = "linux")]
 mod agent;
 mod console;
+mod desktop_stdio;
 mod setup_code;
 mod udp_pad;
 
@@ -1680,6 +1681,9 @@ enum Wifi {
 /// one escaped blob — worst for the failure that lists what the radio saw, which is a dozen lines.
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    if desktop_stdio::invoked() {
+        return desktop_stdio::run().await;
+    }
     match run().await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
