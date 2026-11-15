@@ -144,9 +144,12 @@ the exit status are ssh's own. The account is `--user`, else `DUCK_BOARD_USER` f
 
 A shipping image answers ssh only on the head's USB-C link (`microduck@192.168.42.1`), never on
 wifi (microduck_yocto#110), so over wifi `duckctl ssh` stops with "refused ssh" before ssh would.
-That is deliberate, and there is no way to change it from Bluetooth: a shell on wifi means opening
-the robot. Over the USB link, `sudo touch /run/microduck-ssh-wifi` opens it until the next reboot;
-or flash the dev image, which keeps ssh open on wifi.
+That is deliberate, and there is no way to change it from Bluetooth: a shell on wifi takes hands
+on the robot. Holding the face button for 5 s (a pin through the hole) opens it for 30 minutes, with a honk,
+and the network LED blinks blue while it is open; holding again restarts the 30 minutes. Over the
+USB link, `sudo touch /run/microduck-ssh-wifi` opens it until the next reboot. Either way a reboot
+closes it, and sessions already open outlive the 30 minutes. Or flash the dev image, which keeps
+ssh open on wifi.
 
 `ssh` and `scp` remember where they last found each robot, in `~/.cache/duckctl/addresses`
 (`$XDG_CACHE_HOME` if set), and try that address first: if something answers on port 22 within a
@@ -780,7 +783,16 @@ duckctl --name <robot-name> nfc-flash walk_mode
 
 The duck asks for a tag with its pad-lost sound; touch a tag to its head within 20 seconds
 (`--timeout`, up to 120). It quacks when the tag took. What is written and what is refused is in
-[`pair-a-gamepad.md`](pair-a-gamepad.md#writing-a-tag).
+[`nfc-tags.md`](nfc-tags.md#writing-a-tag).
+
+## Reading an NFC tag
+
+```bash
+duckctl --name <robot-name> nfc-read
+```
+
+The same wait, then the tag's UID and records as `nfc.read` answers them, as JSON. While it waits
+the tag is only read, never acted on — [`nfc-tags.md`](nfc-tags.md#reading-a-tag).
 
 ## Anything else — `call`
 

@@ -11,14 +11,17 @@ KAS build and bench procedure. This is a kernel/DTB and mixer change, not
 something a daemon-only OTA (or a Flutter update) can supply. It leaves
 the stock hardware I²C3 pinmux and USB-C PD controller in place.
 
-For the new app rows and audio tests, also install this repo's **matching
-API58** daemon build and include `duck-audio-test` in its `bin/` with the
-shipped `systemd/duck-audio-test.socket`,
-`systemd/duck-audio-test@.service` and sysusers entry. The packaged daemon's
-postinstall installs and starts the listener; a custom offline WIC overlay
-must stage the same files/account and enable the socket at image creation.
-Do not flash the Audio-only KAS build expecting the API58 helper; it still
-uses the pinned upstream daemon. There is no new production OTA or WIC here.
+For the hardware diagnostic rows and audio tests, use this fork's diagnostic
+daemon build and an app that supports its BLE API version (**61** after the
+0.21.1 merge; the existing `openmd.3` test image remains on fork API 58).
+The API version alone does not guarantee the fork's diagnostics are present.
+Stage `duck-audio-test` in the release's `bin/` together with
+`systemd/duck-audio-test.socket`, `systemd/duck-audio-test@.service` and the
+sysusers entry. The daemon postinstall installs and starts the listener if
+these components were included; a custom offline WIC overlay must stage the
+same files/account and enable the socket at image creation.
+The audio-only KAS build still uses the pinned upstream daemon and does not
+supply the helper. There is no new production OTA or WIC here.
 
 ## BLE contract
 
