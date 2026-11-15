@@ -10,7 +10,7 @@ duck-ipc-proto = { path = "../duck-ipc-proto" }
 duck-control = { path = "../duck-control" }
 robotd-params = { path = "../robotd-params" }
 toml_edit = "0.23"
-axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
+axum = { version = "0.8.9", default-features = false, features = ["form", "http1", "json", "query", "tokio", "ws"] }
 clap = { workspace = true, features = ["derive"] }
 futures-util = "0.3"
 serde = { workspace = true, features = ["derive"] }
@@ -18,3 +18,6 @@ serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "process"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+socket2 = { version = "0.6", features = ["all"] }

@@ -1,0 +1,27 @@
+[Unit]
+Description=MicroDuck first-run isolated Wi-Fi setup
+Wants=NetworkManager.service configd.service
+After=NetworkManager.service configd.service getty@tty1.service microduck-osupdate.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/duck-wifi-setup
+ExecStopPost=/usr/libexec/duck-wifi-setup --cleanup
+RuntimeDirectory=microduck-wifi-setup
+RuntimeDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ReadWritePaths=/run/NetworkManager
+RestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+TimeoutStopSec=55
+TasksMax=32
+
+[Install]
+WantedBy=multi-user.target
