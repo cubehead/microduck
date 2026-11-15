@@ -3104,18 +3104,10 @@ impl Variant {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Platform {
     pub variant: Variant,
-}
-
-impl Default for Platform {
-    fn default() -> Self {
-        Self {
-            variant: Variant::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

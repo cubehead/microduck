@@ -562,9 +562,9 @@ echo "    [ok] setup-board fixes overlay_prefix and enables uart2-m0"
 # check needs a live board (`sudo i2cdetect -y 4` answering 0x6A). This is the /dev/i2c-imu
 # half of that check, and the wiring that makes the live check possible.
 grep -E "^overlays=" /boot/armbianEnv.txt | grep -qw i2c4-imu
-grep -q 'KERNELS=="fe5d0000.i2c", SYMLINK+="i2c-imu"' /etc/udev/rules.d/99-robot-i2c-imu.rules
+grep -Fq "KERNELS==\"fe5d0000.i2c\", SYMLINK+=\"i2c-imu\"" /etc/udev/rules.d/99-robot-i2c-imu.rules
 # The two udev rules must not clobber each other: one file per stale name.
-grep -q 'SYMLINK+="i2c-pihat"' /etc/udev/rules.d/99-robot-i2c-pihat.rules
+grep -Fq "SYMLINK+=\"i2c-pihat\"" /etc/udev/rules.d/99-robot-i2c-pihat.rules
 echo "    [ok] setup-board enables i2c4-imu and names it /dev/i2c-imu"
 
 # A getty *reads* the port, consuming servo replies, so every motor looks absent —
