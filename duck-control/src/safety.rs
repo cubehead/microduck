@@ -165,6 +165,10 @@ pub struct Safety<T: RobotIo, U: ImuIo> {
     /// it, so the gate is the read itself: a battery estimate only exists for a tick whose
     /// read was clean, and otherwise the last good estimate stands.
     last_read_clean: bool,
+    /// Goal PWM the caller last asked for, and whether the servos still hold it. Kept apart
+    /// because a reboot loses the register but not the wish: [`Self::apply`] puts it back.
+    goal_pwm: Option<u16>,
+    goal_pwm_written: bool,
     /// Trip counts, for rate-limiting what the layer says about itself.
     runs: LimitRuns,
     /// Whether an intent has ever arrived inside the deadman, which is what makes a stale
@@ -183,6 +187,8 @@ impl<T: RobotIo, U: ImuIo> Safety<T, U> {
             fallen: false,
             gain: None,
             last_read_clean: false,
+            goal_pwm: None,
+            goal_pwm_written: false,
             runs: LimitRuns::default(),
             deadman_armed: false,
         }
@@ -288,7 +294,34 @@ impl<T: RobotIo, U: ImuIo> Safety<T, U> {
             self.io.reboot(id)?;
         }
         self.gain = None;
+        self.goal_pwm_written = false;
         Ok(())
+    }
+
+    pub fn supports_goal_pwm(&self) -> bool {
+        self.io.supports_goal_pwm()
+    }
+
+    /// Cap the motors' duty cycle at `pwm` out of [`crate::model::GOAL_PWM_MAX`] — see
+    /// [`crate::model::goal_pwm_for`].
+    ///
+    /// Written now, and always, even when unchanged: the caller asks rarely (robotd every ten
+    /// seconds), and a rewrite is what catches a servo that lost its RAM in a way nothing here
+    /// saw — a brown-out, a swap. A failed write is retried by the next [`Self::apply`].
+    pub fn set_goal_pwm(&mut self, pwm: u16) -> Result<(), IoError> {
+        if !self.supports_goal_pwm() {
+            return Err(IoError::GoalPwmUnsupported);
+        }
+        self.goal_pwm = Some(pwm);
+        self.goal_pwm_written = false;
+        self.io.set_goal_pwm(pwm)?;
+        self.goal_pwm_written = true;
+        Ok(())
+    }
+
+    /// The Goal PWM last asked for, or `None` before the first request.
+    pub fn goal_pwm(&self) -> Option<u16> {
+        self.goal_pwm
     }
 
     /// The gain last written to the servos, or `None` before the first write. This is what
@@ -424,6 +457,9 @@ impl<T: RobotIo, U: ImuIo> Safety<T, U> {
         // worth doing about is decided above, and arrives as ordinary targets and an
         // ordinary gain.
         self.set_gain(running_gain)?;
+        if let Some(pwm) = self.goal_pwm.filter(|_| !self.goal_pwm_written) {
+            self.set_goal_pwm(pwm)?;
+        }
 
         // Non-finite is refused, not clamped. Clamping `NaN` silently produces a boundary
         // value, which is a plausible-looking joint angle — far worse than declining to
@@ -534,6 +570,45 @@ mod tests {
         );
         s.apply(DEFAULT_POSITION, DEFAULT_POSITION, 200).unwrap();
         assert_eq!(s.gain(), Some(200));
+    }
+
+    /// Goal PWM is written when asked, not again on every tick, and comes back on the first
+    /// apply after a reboot — a rebooted servo is at its EEPROM PWM Limit, 100 %, otherwise.
+    #[test]
+    fn goal_pwm_is_written_once_and_restored_after_a_reboot() {
+        let mut s = safety();
+        s.apply(DEFAULT_POSITION, DEFAULT_POSITION, 200).unwrap();
+        assert!(
+            s.io().goal_pwms.is_empty(),
+            "nothing asked, nothing written"
+        );
+
+        s.set_goal_pwm(648).unwrap();
+        s.apply(DEFAULT_POSITION, DEFAULT_POSITION, 200).unwrap();
+        s.apply(DEFAULT_POSITION, DEFAULT_POSITION, 200).unwrap();
+        assert_eq!(s.io().goal_pwms, vec![648]);
+
+        s.reboot_motors(&[3]).unwrap();
+        s.apply(DEFAULT_POSITION, DEFAULT_POSITION, 200).unwrap();
+        s.apply(DEFAULT_POSITION, DEFAULT_POSITION, 200).unwrap();
+        assert_eq!(s.io().goal_pwms, vec![648, 648]);
+        assert_eq!(s.goal_pwm(), Some(648));
+    }
+
+    #[test]
+    fn unsupported_goal_pwm_is_neither_written_nor_queued_for_retry() {
+        let mut s = Safety::new(
+            FakeIo::at(DEFAULT_POSITION).without_goal_pwm(),
+            FakeImu::new(),
+            SafetyConfig::default(),
+        );
+        assert!(matches!(
+            s.set_goal_pwm(648),
+            Err(IoError::GoalPwmUnsupported)
+        ));
+        s.apply(DEFAULT_POSITION, DEFAULT_POSITION, 200).unwrap();
+        assert!(s.io().goal_pwms.is_empty());
+        assert_eq!(s.goal_pwm(), None);
     }
 
     use super::*;

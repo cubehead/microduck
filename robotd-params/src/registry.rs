@@ -135,6 +135,11 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Bool,
         "Impact guard on V3 and V4 servos; off = factory firmware with Current Limit only",
     ),
+    feature(
+        "bus.battery_voltage_based_pwm_limit",
+        Kind::Bool,
+        "XL330 only: cap motor PWM so the motors see ~6 V whatever the battery charge",
+    ),
     entry(
         "bus.impact_guard_v_min",
         Kind::Integer,
@@ -1694,6 +1699,7 @@ mod tests {
             features,
             vec![
                 "platform.variant",
+                "bus.battery_voltage_based_pwm_limit",
                 "policy.enabled",
                 "policy.mode",
                 "policy.voltage_adapt",

@@ -70,6 +70,8 @@ pub enum IoError {
         expected: usize,
         got: usize,
     },
+    #[error("Goal PWM is not supported by this servo driver")]
+    GoalPwmUnsupported,
     #[error("simulated failure")]
     Simulated,
 }
@@ -156,6 +158,21 @@ pub trait RobotIo {
     /// in; dropping the gain lets it yield. The prototype does the same, at kP 50 against
     /// a running value of 200.
     fn set_gain(&mut self, kp: u16) -> Result<()>;
+
+    /// The bus implements the XL330 Goal PWM register. Other servo families and simulations
+    /// must not receive its register writes or report them as applied.
+    fn supports_goal_pwm(&self) -> bool {
+        false
+    }
+
+    /// Set Goal PWM (register 100, RAM) on every joint: the duty-cycle cap, out of
+    /// [`crate::model::GOAL_PWM_MAX`], that keeps the motor at
+    /// [`crate::model::MOTOR_MAX_V`] whatever the pack's charge ([`crate::model::goal_pwm_for`]).
+    ///
+    /// Unsupported implementations fail rather than acknowledging an unapplied cap.
+    fn set_goal_pwm(&mut self, _pwm: u16) -> Result<()> {
+        Err(IoError::GoalPwmUnsupported)
+    }
 
     /// Torque on or off, every joint.
     ///
@@ -293,6 +310,9 @@ pub struct FakeIo {
     pub writes: usize,
     /// Last gain commanded, so a test can tell "went limp" from "stopped commanding".
     pub last_gain: Option<u16>,
+    /// Every Goal PWM commanded, in order, so a test can tell "refreshed" from "written once".
+    pub goal_pwms: Vec<u16>,
+    goal_pwm_supported: bool,
     /// What [`RobotIo::slow_sensors`] reports. Mid-pack and hand-warm by default so `--fake`
     /// shows a plausible robot; set it to exercise a flat pack or a cooking servo. `None`
     /// fails the read, which is what a robot with no bus does.
@@ -343,6 +363,8 @@ impl FakeIo {
             reads: 0,
             writes: 0,
             last_gain: None,
+            goal_pwms: Vec::new(),
+            goal_pwm_supported: true,
             slow: Some(SlowSensors {
                 volts: 7.4,
                 temps_c: [32.0; NUM_JOINTS],
@@ -373,6 +395,12 @@ impl FakeIo {
     /// servos are limp, or one being pushed around by hand.
     pub fn frozen(mut self) -> Self {
         self.track_targets = false;
+        self
+    }
+
+    /// Model a backend that cannot apply XL330 Goal PWM.
+    pub fn without_goal_pwm(mut self) -> Self {
+        self.goal_pwm_supported = false;
         self
     }
 
@@ -447,6 +475,18 @@ impl RobotIo for FakeIo {
 
     fn set_gain(&mut self, kp: u16) -> Result<()> {
         self.last_gain = Some(kp);
+        Ok(())
+    }
+
+    fn supports_goal_pwm(&self) -> bool {
+        self.goal_pwm_supported
+    }
+
+    fn set_goal_pwm(&mut self, pwm: u16) -> Result<()> {
+        if !self.supports_goal_pwm() {
+            return Err(IoError::GoalPwmUnsupported);
+        }
+        self.goal_pwms.push(pwm);
         Ok(())
     }
 

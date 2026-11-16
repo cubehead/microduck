@@ -146,6 +146,11 @@ const HOME_RAMP: Duration = Duration::from_secs(2);
 /// `microduck_runtime`.
 const BATTERY_EMA_ALPHA: f64 = 0.1;
 
+/// How often Goal PWM follows the battery ([`duck_control::goal_pwm_for`]). The EMA it reads
+/// already moves over ~10 s, and a pack drains over an hour: anything faster rewrites fifteen
+/// servos to learn nothing, anything much slower leaves a fresh pack's first minutes uncapped.
+const GOAL_PWM_INTERVAL: Duration = Duration::from_secs(10);
+
 /// How long the policy holds the shutdown sit before the rest ramp, when no controller is there
 /// to say. The sitstand descent is a deliberate ~2 s glide and the robot then sits still for a
 /// second; a running controller derives the same from the set's `ramp_s`
@@ -772,6 +777,11 @@ struct RobotState {
     motor_mean_c: AtomicU64,
     /// Index into [`duck_control::JOINT_NAMES`] of the hottest joint.
     motor_hottest: AtomicU32,
+    /// The Goal PWM last written by a capable XL330 backend while
+    /// `bus.battery_voltage_based_pwm_limit` is on, for `robot.health`. Zero means not reported
+    /// (unsupported, off, or before the first write), since a
+    /// written Goal PWM is never 0.
+    goal_pwm: AtomicU32,
     /// Hottest board thermal zone, as `f64::to_bits`. Zero means no reading — off Linux, or a
     /// kernel with no thermal sysfs ([`soc`]).
     cpu_temp_c: AtomicU64,
@@ -948,6 +958,7 @@ impl RobotState {
             motor_max_c: AtomicU64::new(0),
             motor_mean_c: AtomicU64::new(0),
             motor_hottest: AtomicU32::new(0),
+            goal_pwm: AtomicU32::new(0),
             cpu_temp_c: AtomicU64::new(0),
             cpu_throttle: ArcSwapOption::empty(),
             imu_stale_blocks: AtomicU64::new(0),
@@ -1008,6 +1019,10 @@ impl RobotState {
                 degraded,
                 reason,
                 battery: self.battery(),
+                goal_pwm: match self.goal_pwm.load(Ordering::Relaxed) {
+                    0 => None,
+                    pwm => Some(pwm as u16),
+                },
                 motors: self.motor_thermal(),
                 cpu_temp_c: {
                     // Zero is "never read", the same sentinel the battery uses: a board at
@@ -1529,7 +1544,7 @@ fn spawn_control_thread(
                 tracing::warn!("--fake: no bus, no robot");
                 let home = duck_control::standing_pose(params.policy.home.as_deref());
                 runtime.block_on(control_loop(
-                    FakeIo::at(home),
+                    FakeIo::at(home).without_goal_pwm(),
                     FakeImu::new(),
                     state,
                     intents,
@@ -1683,6 +1698,14 @@ impl SharedDxl {
 
 #[cfg(target_os = "linux")]
 impl RobotIo for SharedDxl {
+    fn supports_goal_pwm(&self) -> bool {
+        self.0.borrow().supports_goal_pwm()
+    }
+
+    fn set_goal_pwm(&mut self, pwm: u16) -> duck_control::io::Result<()> {
+        self.0.borrow_mut().set_goal_pwm(pwm)
+    }
+
     fn reboot(&mut self, id: u8) -> duck_control::io::Result<()> {
         RobotIo::reboot(&mut *self.0.borrow_mut(), id)
     }
@@ -1847,6 +1870,17 @@ enum BusIo {
 
 #[cfg(target_os = "linux")]
 impl RobotIo for BusIo {
+    fn supports_goal_pwm(&self) -> bool {
+        matches!(self, Self::Dxl(io) if io.supports_goal_pwm())
+    }
+
+    fn set_goal_pwm(&mut self, pwm: u16) -> duck_control::io::Result<()> {
+        match self {
+            Self::Dxl(io) => io.set_goal_pwm(pwm),
+            Self::Ft(_) => Err(duck_control::IoError::GoalPwmUnsupported),
+        }
+    }
+
     fn position_write_arms(&self) -> bool {
         matches!(self, Self::Ft(_))
     }
@@ -3037,6 +3071,14 @@ async fn control_loop<T: RobotIo, U: ImuIo>(
         Err(e) => tracing::debug!(error = %e, "vet book: servo identity read failed"),
     }
     let mut last_alert_read = Instant::now();
+    // `None` until the first voltage reading, so the cap goes on with the first sample rather
+    // than ten seconds after it.
+    let mut last_goal_pwm: Option<Instant> = None;
+    let supports_goal_pwm = safety.supports_goal_pwm();
+    let pwm_follows_battery = params.bus.battery_voltage_based_pwm_limit;
+    if pwm_follows_battery && !supports_goal_pwm {
+        tracing::warn!("battery voltage based PWM is XL330-only; ignoring on this backend");
+    }
 
     tracing::warn!(
         joints = NUM_JOINTS,
@@ -5259,6 +5301,41 @@ async fn control_loop<T: RobotIo, U: ImuIo>(
             }
             vettally.handoff(&state.vetbook, volts, false);
 
+            // `bus.battery_voltage_based_pwm_limit`: Goal PWM follows the pack, so the motors see
+            // ~6 V whether it is full or nearly flat, rewritten every interval even when
+            // unchanged — see `Safety::set_goal_pwm`. Off writes full duty once: Goal PWM is
+            // servo RAM, so a cap from an earlier run outlives a robotd restart otherwise.
+            let want = if !supports_goal_pwm {
+                None
+            } else if pwm_follows_battery {
+                duck_control::goal_pwm_for(volts)
+            } else {
+                last_goal_pwm
+                    .is_none()
+                    .then_some(duck_control::model::GOAL_PWM_MAX)
+            };
+            if last_goal_pwm.is_none_or(|t| t.elapsed() >= GOAL_PWM_INTERVAL)
+                && let Some(pwm) = want
+            {
+                last_goal_pwm = Some(Instant::now());
+                let previous = safety.goal_pwm();
+                let result = safety.set_goal_pwm(pwm);
+                if pwm_follows_battery && result.is_ok() {
+                    state.goal_pwm.store(u32::from(pwm), Ordering::Relaxed);
+                }
+                match result {
+                    Ok(()) if previous.is_none() => tracing::info!(
+                        goal_pwm = pwm,
+                        battery_v = format!("{volts:.2}"),
+                        follows_battery = pwm_follows_battery,
+                        "goal PWM set"
+                    ),
+                    Ok(()) => tracing::debug!(goal_pwm = pwm, battery_v = volts, "goal PWM"),
+                    // Retried by the next apply, and again in ten seconds.
+                    Err(e) => tracing::debug!(error = %e, goal_pwm = pwm, "goal PWM write failed"),
+                }
+            }
+
             if last_summary.elapsed() >= LOOP_SUMMARY_INTERVAL {
                 tracing::info!(
                     total = ticks,
@@ -5273,6 +5350,7 @@ async fn control_loop<T: RobotIo, U: ImuIo>(
                         "{:.2}",
                         f64::from_bits(state.battery_v.load(Ordering::Relaxed))
                     ),
+                    goal_pwm = safety.goal_pwm(),
                     motor_max_c = format!(
                         "{:.0}",
                         f64::from_bits(state.motor_max_c.load(Ordering::Relaxed))
@@ -8726,9 +8804,102 @@ mod tests {
         );
     }
 
+    /// Run the loop on a `FakeIo` until the first battery sample lands, and a few ticks more;
+    /// return every Goal PWM it wrote. The slow-sensor window is a `std` second, so this takes
+    /// one real second whatever tokio's clock does.
+    async fn goal_pwms_after_first_battery_sample(
+        params: Params,
+        supports_goal_pwm: bool,
+    ) -> (Vec<u16>, u32) {
+        let s = Arc::new(RobotState::new(
+            &params,
+            std::path::Path::new("/test/robotd.toml"),
+            false,
+            false,
+        ));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let loop_state = Arc::clone(&s);
+        let handle = tokio::spawn(async move {
+            let mut io = FakeIo::at(DEFAULT_POSITION);
+            if !supports_goal_pwm {
+                io = io.without_goal_pwm();
+            }
+            control_loop(
+                Borrowed(&mut io),
+                FakeImu::new(),
+                loop_state,
+                Arc::new(Intents::new()),
+                params,
+                PathBuf::from("/nonexistent/robotd.toml"),
+                Duration::from_millis(2),
+                Arc::new(|| {}),
+            )
+            .await;
+            tx.send(io.goal_pwms).unwrap();
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while s.battery_v.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_ne!(
+            s.battery_v.load(Ordering::Relaxed),
+            0,
+            "a battery sample landed"
+        );
+        let ticks = s.ticks.load(Ordering::Relaxed);
+        while s.ticks.load(Ordering::Relaxed) < ticks + 10 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        s.shutdown.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+        (rx.recv().unwrap(), s.goal_pwm.load(Ordering::Relaxed))
+    }
+
+    /// On, the cap goes on with the first voltage sample — `FakeIo`'s 7.4 V pack is 718 of 885 —
+    /// and is not rewritten every tick.
+    #[tokio::test(start_paused = true)]
+    async fn goal_pwm_follows_the_battery_when_asked() {
+        let mut params = Params::default();
+        params.bus.battery_voltage_based_pwm_limit = true;
+        let (written, reported) = goal_pwms_after_first_battery_sample(params, true).await;
+        assert_eq!(written, vec![duck_control::goal_pwm_for(7.4).unwrap()]);
+        assert_eq!(written, vec![718]);
+        assert_eq!(reported, 718);
+    }
+
+    /// Off, the default, writes full duty once: Goal PWM is servo RAM, and a cap from an earlier
+    /// run with the setting on would otherwise outlive the restart that turned it off.
+    #[tokio::test(start_paused = true)]
+    async fn goal_pwm_is_reset_to_full_duty_when_off() {
+        let params = Params::default();
+        assert!(
+            !params.bus.battery_voltage_based_pwm_limit,
+            "off by default"
+        );
+        let (written, reported) = goal_pwms_after_first_battery_sample(params, true).await;
+        assert_eq!(written, vec![duck_control::model::GOAL_PWM_MAX]);
+        assert_eq!(reported, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unsupported_goal_pwm_never_writes_or_reports_a_cap() {
+        for requested in [false, true] {
+            let mut params = Params::default();
+            params.bus.battery_voltage_based_pwm_limit = requested;
+            let (written, reported) = goal_pwms_after_first_battery_sample(params, false).await;
+            assert!(written.is_empty());
+            assert_eq!(reported, 0);
+        }
+    }
+
     /// `FakeIo` by reference, so a test can read what the loop did to it after the loop ends.
     struct Borrowed<'a, T>(&'a mut T);
     impl<T: RobotIo> RobotIo for Borrowed<'_, T> {
+        fn supports_goal_pwm(&self) -> bool {
+            self.0.supports_goal_pwm()
+        }
+
         fn read(&mut self) -> duck_control::io::Result<duck_control::Sensors> {
             self.0.read()
         }
@@ -8737,6 +8908,9 @@ mod tests {
         }
         fn set_gain(&mut self, kp: u16) -> duck_control::io::Result<()> {
             self.0.set_gain(kp)
+        }
+        fn set_goal_pwm(&mut self, pwm: u16) -> duck_control::io::Result<()> {
+            self.0.set_goal_pwm(pwm)
         }
         fn set_torque(&mut self, on: bool) -> duck_control::io::Result<()> {
             self.0.set_torque(on)
@@ -11385,6 +11559,12 @@ mod tests {
             fn set_gain(&mut self, kp: u16) -> duck_control::io::Result<()> {
                 self.0.set_gain(kp)
             }
+            fn supports_goal_pwm(&self) -> bool {
+                self.0.supports_goal_pwm()
+            }
+            fn set_goal_pwm(&mut self, pwm: u16) -> duck_control::io::Result<()> {
+                self.0.set_goal_pwm(pwm)
+            }
             fn set_torque(&mut self, on: bool) -> duck_control::io::Result<()> {
                 self.0.set_torque(on)
             }
@@ -11830,6 +12010,12 @@ mod tests {
         }
         fn set_gain(&mut self, kp: u16) -> duck_control::io::Result<()> {
             self.inner.set_gain(kp)
+        }
+        fn supports_goal_pwm(&self) -> bool {
+            self.inner.supports_goal_pwm()
+        }
+        fn set_goal_pwm(&mut self, pwm: u16) -> duck_control::io::Result<()> {
+            self.inner.set_goal_pwm(pwm)
         }
         fn set_torque(&mut self, on: bool) -> duck_control::io::Result<()> {
             self.inner.set_torque(on)
