@@ -2463,7 +2463,7 @@ fn run_health(
     let mut report = HealthReport {
         robot: None,
         robot_error: None,
-        software: collect_version_report(socket, robot_socket, config_socket),
+        software: collect_version_report(socket, robot_socket, config_socket, false),
         camera: proto::read_camera_stats(),
         camera_stopped_secs: proto::camera_stats_age()
             .filter(|age| *age > proto::CAMERA_STATS_MAX_AGE)
@@ -2797,7 +2797,7 @@ fn run_version(
     config_socket: &Path,
     json: bool,
 ) -> Result<(), Failure> {
-    let report = collect_version_report(socket, robot_socket, config_socket);
+    let report = collect_version_report(socket, robot_socket, config_socket, true);
 
     if json {
         println!(
@@ -2818,6 +2818,7 @@ fn collect_version_report(
     socket: &Path,
     robot_socket: &Path,
     config_socket: &Path,
+    include_updater: bool,
 ) -> VersionReport {
     let build = proto::build_info!();
     let mut report = VersionReport {
@@ -2833,28 +2834,30 @@ fn collect_version_report(
     let mut updaterd_running: Option<semver::Version> = None;
     // Which of the two silences an absent `last_checked` is — see [`SourceCheck`].
     let mut updaterd_api: Option<u32> = None;
-    match Client::connect(socket) {
-        Err(failure) => report
-            .services
-            .push(ServiceReport::failed("updaterd", failure.message)),
-        Ok(mut client) => {
-            let hello = client.hello_result();
-            match hello {
-                Ok(hello) => {
-                    updaterd_running = hello.daemon_version.clone();
-                    updaterd_api = Some(hello.api_version);
-                    report.services.push(ServiceReport {
-                        name: "updaterd",
-                        version: hello.daemon_version.map(|v| v.to_string()),
-                        revision: hello.revision,
-                        error: None,
-                    });
+    if include_updater {
+        match Client::connect(socket) {
+            Err(failure) => report
+                .services
+                .push(ServiceReport::failed("updaterd", failure.message)),
+            Ok(mut client) => {
+                let hello = client.hello_result();
+                match hello {
+                    Ok(hello) => {
+                        updaterd_running = hello.daemon_version.clone();
+                        updaterd_api = Some(hello.api_version);
+                        report.services.push(ServiceReport {
+                            name: "updaterd",
+                            version: hello.daemon_version.map(|v| v.to_string()),
+                            revision: hello.revision,
+                            error: None,
+                        });
+                    }
+                    Err(failure) => report
+                        .services
+                        .push(ServiceReport::failed("updaterd", failure.message)),
                 }
-                Err(failure) => report
-                    .services
-                    .push(ServiceReport::failed("updaterd", failure.message)),
+                report.components = installed_components(&mut client, updaterd_api);
             }
-            report.components = installed_components(&mut client, updaterd_api);
         }
     }
 
@@ -2915,6 +2918,11 @@ fn collect_version_report(
         }
     }
 
+    // OpenMicroDuck has no updaterd service. Filter both the display and the input
+    // to warning generation for health; version keeps the upstream inventory.
+    if !include_updater {
+        report.units.retain(|unit| unit.unit != "updaterd.service");
+    }
     report.warnings = version_warnings(&report, updaterd_running.as_ref());
     report
 }
